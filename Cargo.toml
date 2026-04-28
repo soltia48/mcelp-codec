@@ -1,0 +1,10 @@
+[package]
+name = "mcelp_codec"
+version = "0.1.0"
+edition = "2024"
+description = "Mitsubishi CELP speech codec"
+
+[lib]
+path = "src/lib.rs"
+
+[dependencies]

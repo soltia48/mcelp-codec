@@ -18,8 +18,8 @@ pitch state) while excitation and synthesis are "per-subframe".
 
 ## 2. Top-level decode flow
 
-The entry point is [`Codec::decode_frame`](../src/lib.rs) in
-[src/lib.rs](../src/lib.rs). The decoder runs the following stages in order
+The entry point is [`Codec::decode_frame`](../../src/lib.rs) in
+[src/lib.rs](../../src/lib.rs). The decoder runs the following stages in order
 on each 18-byte frame:
 
 ```
@@ -171,4 +171,4 @@ encoding of the 18-byte frame. The CLI uses [`parse_frame_hex`][1] to convert.
 This is purely a convenience for command-line experiments; the codec library
 itself operates on raw 18-byte slices.
 
-[1]: ../src/bitstream.rs
+[1]: ../../src/bitstream.rs

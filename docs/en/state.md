@@ -4,7 +4,7 @@ The decoder is a streaming, frame-stateful machine: each 18-byte frame
 depends on roughly a frame's worth of state inherited from the previous
 frame. This document enumerates that state and explains how each piece
 flows between frames, blocks, and subframes. Source:
-[src/state.rs](../src/state.rs), [src/lib.rs](../src/lib.rs).
+[src/state.rs](../../src/state.rs), [src/lib.rs](../../src/lib.rs).
 
 ## 1. The `DecoderState` struct
 

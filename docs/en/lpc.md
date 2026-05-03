@@ -9,11 +9,11 @@ that chain end-to-end.
 
 Source files:
 
-- [src/lsf.rs](../src/lsf.rs) — LSF decoding and LSP conversion
-- [src/lpc_analysis.rs](../src/lpc_analysis.rs) — autocorrelation + Levinson +
+- [src/lsf.rs](../../src/lsf.rs) — LSF decoding and LSP conversion
+- [src/lpc_analysis.rs](../../src/lpc_analysis.rs) — autocorrelation + Levinson +
   stability check
-- [src/tables/lsf.rs](../src/tables/lsf.rs) — VQ codebooks and predictor
-- [src/tables/lsp.rs](../src/tables/lsp.rs) — cosine LUT
+- [src/tables/lsf.rs](../../src/tables/lsf.rs) — VQ codebooks and predictor
+- [src/tables/lsp.rs](../../src/tables/lsp.rs) — cosine LUT
 
 ## 1. LSF decoding
 
@@ -43,7 +43,7 @@ scratch[0..5]  = STAGE1_CODEBOOK[seed][0..5]  + STAGE2_CODEBOOK[upper][0..5]
 scratch[5..10] = STAGE1_CODEBOOK[seed][5..10] + STAGE2_CODEBOOK[lower][5..10]
 ```
 
-Tables are stored in Q15 in [src/tables/lsf.rs](../src/tables/lsf.rs)
+Tables are stored in Q15 in [src/tables/lsf.rs](../../src/tables/lsf.rs)
 (`STAGE1_CODEBOOK` is 128×10, `STAGE2_CODEBOOK` is 64×10).
 
 ### 1.2 Minimum-gap enforcement
@@ -92,7 +92,7 @@ conversion that follows depends on these invariants.
 
 ## 2. LSF → LSP
 
-`lsf_to_lsp` (see [src/lsf.rs](../src/lsf.rs)) implements the discrete
+`lsf_to_lsp` (see [src/lsf.rs](../../src/lsf.rs)) implements the discrete
 cosine transform that maps a normalized LSF (Q15, on the range `[0, 0.5)`)
 to the corresponding LSP (= `cos(π · lsf)`):
 
@@ -107,7 +107,7 @@ The constant 20861 is `64 · 2^15 / π ≈ 20861` so that
 `scaled >> 24` is the integer index into a 64-entry cosine LUT, while the
 remaining 8 fraction bits (Q8) interpolate linearly between table cells
 using a precomputed slope. Tables `COS_LUT_VALUE` and `COS_LUT_SLOPE` are
-in [src/tables/lsp.rs](../src/tables/lsp.rs).
+in [src/tables/lsp.rs](../../src/tables/lsp.rs).
 
 The decoder also retains a `prev_frame_lsp` so that `block_average_lsp`
 (component-wise `(prev + curr) >> 1`) can produce the **block-0 work
@@ -251,7 +251,7 @@ the decoder uses it to decide whether to enable the pitch-periodicity
 enhancement IIR for that subframe.
 
 A separate utility `lpc_to_first_reflection` is also provided in
-[src/lsf.rs](../src/lsf.rs); it implements the inverse Levinson (Schur
+[src/lsf.rs](../../src/lsf.rs); it implements the inverse Levinson (Schur
 recursion) on a Q12 LPC vector. It is currently unused in the runtime
 decode path but is kept for symmetry with encoder-side analysis and for
 unit testing.
@@ -294,4 +294,4 @@ vectors** — `sub0_lpc`, `sub1_lpc`, `sub2_lpc`, `sub3_lpc` — together with
 this point the LPC analysis is finished; the synthesis pipeline does not
 further transform these coefficients.
 
-[lsf]: ../src/lsf.rs
+[lsf]: ../../src/lsf.rs

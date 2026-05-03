@@ -14,10 +14,10 @@ e[n] = pitch_gain · v[n] + fcb_gain · c[n]      (sum scaled by mix_excitation)
 
 This document covers the generation of `v` and `c`. Gain quantization (the
 computation of `pitch_gain` and `fcb_gain`) is the subject of
-[gain.md](gain.md). Source: [src/pitch.rs](../src/pitch.rs),
-[src/fcb.rs](../src/fcb.rs), [src/tables/pitch.rs](../src/tables/pitch.rs),
-[src/tables/fcb_short.rs](../src/tables/fcb_short.rs),
-[src/tables/fcb_main.rs](../src/tables/fcb_main.rs).
+[gain.md](gain.md). Source: [src/pitch.rs](../../src/pitch.rs),
+[src/fcb.rs](../../src/fcb.rs), [src/tables/pitch.rs](../../src/tables/pitch.rs),
+[src/tables/fcb_short.rs](../../src/tables/fcb_short.rs),
+[src/tables/fcb_main.rs](../../src/tables/fcb_main.rs).
 
 ## 1. Pitch lag decoding
 
@@ -94,7 +94,7 @@ fractional pitch and a phase index `0..2` that selects one of three
 `pitch_adaptive_codebook` synthesises the 80 samples of `v[n]` by
 interpolating between past excitation samples with a 10-tap polyphase
 filter. The interpolation filters live in
-[src/tables/pitch.rs](../src/tables/pitch.rs):
+[src/tables/pitch.rs](../../src/tables/pitch.rs):
 
 ```
 INTERP_FILTER[3][10] in Q15:
@@ -150,7 +150,7 @@ fcb_index in {short path | main path 0 | 1 | 2 | 3 | 4}
 
 ### 3.1 Dispatch and lag class
 
-`fcb_dispatch_lag_class(fcb_index)` (in [src/fcb.rs](../src/fcb.rs))
+`fcb_dispatch_lag_class(fcb_index)` (in [src/fcb.rs](../../src/fcb.rs))
 classifies the 16-bit index against the 6-entry `DISPATCH_THRESHOLDS`:
 
 ```
@@ -215,7 +215,7 @@ fcb_main_codebook_synth → final 80-sample c[n]
 
 Per-class parameters (`BIT_COUNT`, `BIAS`, `T_MPYA_TABLE`, `T_MPY_TABLE`,
 `PULSE_SEEDS`, `PULSE_DATA`, `PULSE_POSITION_CODEBOOK`) live in
-[src/tables/fcb_main.rs](../src/tables/fcb_main.rs). The decoding works
+[src/tables/fcb_main.rs](../../src/tables/fcb_main.rs). The decoding works
 as follows:
 
 1. **Effective index** — subtract a per-class `BIAS` (so that index 0 in
@@ -240,7 +240,7 @@ as follows:
    starting at offset `PULSE_SEEDS[lag_class] · 20`. The number of
    blocks is `bit_count + 1`. The template gives the **amplitudes** of
    the pulses for this lag class (these are not unit pulses but a
-   weighted, decaying envelope; see [src/tables/fcb_main.rs](../src/tables/fcb_main.rs)).
+   weighted, decaying envelope; see [src/tables/fcb_main.rs](../../src/tables/fcb_main.rs)).
 5. **Codebook synthesis** — for each of the `bit_count` pulses,
    `PULSE_POSITION_CODEBOOK[lag_class · 120 + k · 40 + position]` gives
    the *starting position* in the 80-sample subframe, where `position`
@@ -318,4 +318,4 @@ at `write_offset + n` (overwriting the temporary `v[n]` self-feedback
 copy). It is also passed forward to the LPC synthesis filter (see
 [synthesis.md](synthesis.md)).
 
-[synth]: ../src/synth.rs
+[synth]: ../../src/synth.rs

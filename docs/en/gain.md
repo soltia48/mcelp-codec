@@ -8,7 +8,7 @@ fixed tables, an exponential history update of the prediction state, and a
 threshold-driven tail-decay limiter.
 
 This document walks through that pipeline. Source:
-[src/gain.rs](../src/gain.rs), [src/tables/gain.rs](../src/tables/gain.rs).
+[src/gain.rs](../../src/gain.rs), [src/tables/gain.rs](../../src/tables/gain.rs).
 The orchestrator entry point is `gain_orchestrate_codec`.
 
 ## 1. Inputs and outputs
@@ -59,7 +59,7 @@ phase_second_lower= PHASE_TABLE[phase_second_idx + 1]
 ```
 
 `PHASE_TABLE` is a 48-cell quantization table from
-[src/tables/gain.rs](../src/tables/gain.rs). The **upper 3 bits** of
+[src/tables/gain.rs](../../src/tables/gain.rs). The **upper 3 bits** of
 `phase_word` (i.e. `phase_word >> 4`, range 0..7) select a pair of cells
 in `PHASE_TABLE[0..16]`, and the **lower 4 bits** (range 0..15) select a
 pair of cells in `PHASE_TABLE[16..48]`. Conceptually the two halves carry
@@ -121,7 +121,7 @@ result       ← table[lookup_index]
 are tabulated logarithm-like curves: the primary table is approximately
 $\log_2$ of a 16-bit number scaled to Q15, and the secondary table is a
 companion that reshapes the result for the second normalisation. They
-live in [src/tables/gain.rs](../src/tables/gain.rs).
+live in [src/tables/gain.rs](../../src/tables/gain.rs).
 
 `gain_orchestrate_codec` performs one *subtle* additional optimisation
 over the symmetric `gain_orchestrate`: rather than calling the
@@ -202,7 +202,7 @@ through and `(g_p, g_c) = (update_base, initial_gain)`.
 ## 6. Wiring
 
 The four gain results emitted per subframe are wired in
-[src/lib.rs](../src/lib.rs) as:
+[src/lib.rs](../../src/lib.rs) as:
 
 ```
 pitch_gain   = tail.update_base_out   → mix_excitation

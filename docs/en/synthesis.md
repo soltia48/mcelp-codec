@@ -6,11 +6,11 @@ the synthesis filter, (2) the LPC synthesis filter itself, (3) the
 half-frame postfilter, and (4) the linear-to-μ-law conversion. This
 document covers all four.
 
-Source: [src/synth.rs](../src/synth.rs),
-[src/postfilter.rs](../src/postfilter.rs),
-[src/ulaw.rs](../src/ulaw.rs),
-[src/tables/postfilter.rs](../src/tables/postfilter.rs),
-[src/tables/ulaw.rs](../src/tables/ulaw.rs).
+Source: [src/synth.rs](../../src/synth.rs),
+[src/postfilter.rs](../../src/postfilter.rs),
+[src/ulaw.rs](../../src/ulaw.rs),
+[src/tables/postfilter.rs](../../src/tables/postfilter.rs),
+[src/tables/ulaw.rs](../../src/tables/ulaw.rs).
 
 ## 1. <a name="synth-control"></a> Synth control (pitch-enhance gating)
 
@@ -89,7 +89,7 @@ final `>> 16`.
 ## 3. LPC synthesis filter ($1/A(z)$)
 
 `lpc_synthesis_filter(excitation, lpc_coeffs, history)` (in
-[src/synth.rs](../src/synth.rs)) is a straight all-pole IIR:
+[src/synth.rs](../../src/synth.rs)) is a straight all-pole IIR:
 
 ```
 buf[0..10]  = history (last 10 samples of the previous subframe's output)
@@ -139,7 +139,7 @@ slot, then `pitch_adaptive_codebook` of the *next* subframe (or the next
 block) reads from this buffer using a back-offset of `effective_lag`.
 
 After every block — that is, after the second subframe (`i % 2 == 1`)
-— [src/lib.rs](../src/lib.rs) shifts `[160..320]` down to `[0..160]`,
+— [src/lib.rs](../../src/lib.rs) shifts `[160..320]` down to `[0..160]`,
 clears `[160..320]`, and commits `prev_lag = lag_int` so the next block's
 synth-control decision has the correct reference.
 
@@ -148,7 +148,7 @@ synth-control decision has the correct reference.
 After all four subframes are synthesised the decoder holds a 320-sample
 Q15 buffer `synth_pcm`. The postfilter is then applied per **half-frame**
 (160 samples = block) by `postfilter_apply` in
-[src/postfilter.rs](../src/postfilter.rs).
+[src/postfilter.rs](../../src/postfilter.rs).
 
 The postfilter is a **forward + reverse IIR** that combines formant
 emphasis with a tilt correction and a final output-gain trim. Per
@@ -196,7 +196,7 @@ have used.
 ## 6. μ-law conversion
 
 The final 320 Q15 samples are converted to μ-law bytes by
-`linear_i16_to_ulaw` (in [src/ulaw.rs](../src/ulaw.rs)), implementing
+`linear_i16_to_ulaw` (in [src/ulaw.rs](../../src/ulaw.rs)), implementing
 the standard G.711 μ-law encoder:
 
 ```

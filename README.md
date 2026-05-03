@@ -20,23 +20,23 @@ cargo build --release
 
 ## Usage
 
-The `decode` binary reads hex frames from stdin and writes raw μ-law PCM to stdout.
+The `mcelp_decode` binary reads hex frames from stdin and writes raw μ-law PCM to stdout.
 Decode one of the bundled examples:
 
 ```sh
-cargo run --release --bin decode < examples/female.mcelp > female.ulaw
+cargo run --release --bin mcelp_decode < examples/female.mcelp > female.ulaw
 ```
 
 Or pipe directly into a player. With `sox`:
 
 ```sh
-cargo run --release --bin decode < examples/female.mcelp | play -t ul -r 8000 -c 1 -
+cargo run --release --bin mcelp_decode < examples/female.mcelp | play -t ul -r 8000 -c 1 -
 ```
 
 …or with `ffplay`:
 
 ```sh
-cargo run --release --bin decode < examples/female.mcelp | ffplay -f mulaw -ar 8000 -ac 1 -
+cargo run --release --bin mcelp_decode < examples/female.mcelp | ffplay -f mulaw -ar 8000 -ac 1 -
 ```
 
 ## Library

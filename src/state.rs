@@ -55,6 +55,13 @@ pub struct DecoderState {
     /// this value is used and incremented by +1 per subframe (saturates at 143). In the normal path,
     /// this is overwritten by the selected_lag of each subframe.
     pub lag_cursor: i16,
+    /// Self-healing watchdog: remaining frames to force the suppress path
+    /// internally after detecting postfilter saturation runaway. Counts
+    /// down by 1 each frame; refreshed back to `WATCHDOG_SUPPRESS_HOLD_FRAMES`
+    /// whenever the saturation symptom recurs. Reason: undetected corrupt
+    /// frames can drive the postfilter IIR into a self-sustaining
+    /// limit-cycle at ±i16::MAX that the suppress decay path can drain.
+    pub suppress_hold_counter: u8,
     /// `response_shaper` dword scratch buffer. Called 3 times per frame
     /// (stability-check pass → block 0 → block 1); state is carried across passes.
     /// codec init: all zero.
@@ -89,6 +96,7 @@ impl DecoderState {
             prev_pitch_gain: 0,
             prev_fcb_gain: 0,
             lag_cursor: 60,
+            suppress_hold_counter: 0,
             response_shaper_buffer: [0; 35],
             prev_lpc_stability_flag: 0,
         }

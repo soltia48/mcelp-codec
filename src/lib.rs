@@ -21,6 +21,18 @@ pub const HALF_FRAME_SAMPLES: usize = PCM_FRAME_BYTES / 2;
 pub const SUBFRAME_SAMPLES: usize = HALF_FRAME_SAMPLES / 2;
 pub const LPC_ORDER: usize = 10;
 
+/// Self-healing watchdog: per-frame count of postfilter output samples
+/// saturated at ±i16::MAX above which the decoder assumes it has been
+/// driven into a divergent state by corrupt input (e.g. a frame that
+/// slipped past upstream integrity checks). 50% of the frame — orders of
+/// magnitude above what natural speech can produce.
+const WATCHDOG_SATURATION_THRESHOLD: usize = 160;
+/// Self-healing watchdog: number of subsequent frames to force the
+/// `suppress` concealment path after a trigger, giving the postfilter
+/// IIR delay line time to leak out its saturation limit cycle. The
+/// hold extends naturally if the symptom keeps recurring.
+const WATCHDOG_SUPPRESS_HOLD_FRAMES: u8 = 8;
+
 /// Public entry point that decodes one frame: 18 bytes → 320 bytes of μ-law.
 pub struct Codec {
     dec: state::DecoderState,
@@ -52,6 +64,14 @@ impl Codec {
         }
         let canon = bitstream::canonicalize_payload(frame);
         let ctrl = ControlFrame::unpack(&canon);
+
+        // Self-healing watchdog: if a previous frame tripped the saturation
+        // detector, force the suppress concealment path for this frame too.
+        let watchdog_engaged = self.dec.suppress_hold_counter > 0;
+        if watchdog_engaged {
+            self.dec.suppress_hold_counter -= 1;
+        }
+        let effective_suppress = ctrl.suppress || watchdog_engaged;
 
         // 1. LSF → LSP
         let lsf_idx = lsf::LsfIndices::from_control(&ctrl);
@@ -167,7 +187,7 @@ impl Codec {
             //   and update lag_cursor with selected_lag.
             // - suppress=1: Do not call ce3e; use lag_cursor as the selected lag.
             //   sub_lag is 0, cursor is +1 for the next sub (cap 143).
-            let (lag_int, sub_lag) = if ctrl.suppress {
+            let (lag_int, sub_lag) = if effective_suppress {
                 let lag = lag_cursor;
                 lag_cursor = ((lag_cursor as i32) + 1).min(143) as i16;
                 (lag, 0i16)
@@ -233,7 +253,7 @@ impl Codec {
             // Branches based on `mem[0x6f18]` (suppress flag) at the beginning of `func_d1ac` in asm.c:
             // - Non-zero: gain_suppress_decay (threshold +1, multiply gains by decay factor)
             // - Zero:   Normal orchestrate (= gain_orchestrate_codec)
-            let (pitch_gain, fcb_gain) = if ctrl.suppress {
+            let (pitch_gain, fcb_gain) = if effective_suppress {
                 let decay =
                     gain::gain_suppress_decay(threshold, self.dec.prev_pitch_gain, fcb_gain_state);
                 threshold = decay.threshold_out;
@@ -258,10 +278,16 @@ impl Codec {
             fcb_gain_state = fcb_gain;
 
             // 6e. Excitation mix
-            // - normal: pitch_gain × v + fcb_gain × c (standard call to mix_excitation)
-            // - suppress=1 / phase_ctl=0: Sets the pitch component to 0 and scales only the fcb output
-            //   The path where phase_ctl != 0 is decoder-only and does not trigger.
-            let e = if ctrl.suppress {
+            // - watchdog engaged: hard-mute (e = 0). The bitstream suppress
+            //   path's decayed fcb_gain is still close to i16::MAX, so under
+            //   continuous corruption it can keep saturating mix_excitation
+            //   and re-feeding the postfilter limit-cycle. Watchdog mode is
+            //   panic mode: drain every IIR.
+            // - bitstream suppress=1: pitch component zeroed, fcb scaled.
+            // - normal: pitch_gain × v + fcb_gain × c.
+            let e = if watchdog_engaged {
+                [0i16; 80]
+            } else if ctrl.suppress {
                 synth::mix_excitation(&v, &c, 0, fcb_gain)
             } else {
                 synth::mix_excitation(&v, &c, pitch_gain, fcb_gain)
@@ -316,6 +342,26 @@ impl Codec {
             for k in 0..160 {
                 postfiltered[half * 160 + k] = pf[k];
             }
+        }
+
+        // Watchdog: if the postfilter output is heavily saturated, the
+        // decoder is in a divergent state (corrupt frame not caught
+        // upstream → postfilter IIR saturation limit-cycle). The IIR is
+        // self-sustaining once its delay line holds ±i32::MAX dword pairs
+        // — even zero input from the synthesis filter cannot break it via
+        // the linear dynamics alone — so we must do two things on
+        // trigger: (1) zero the postfilter delay/history to break the
+        // cycle, and (2) hold the watchdog suppress for the next several
+        // frames so the LPC synth filter, past-excitation, and any
+        // residual postfilter state all drain cleanly.
+        let saturated = postfiltered
+            .iter()
+            .filter(|&&v| v == i16::MAX || v == i16::MIN)
+            .count();
+        if saturated >= WATCHDOG_SATURATION_THRESHOLD {
+            self.dec.suppress_hold_counter = WATCHDOG_SUPPRESS_HOLD_FRAMES;
+            self.dec.postfilter_history = [0; 6];
+            self.dec.postfilter_delay = [0; 12];
         }
 
         // 8. PCM → μ-law

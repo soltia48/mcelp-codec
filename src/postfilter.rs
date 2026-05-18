@@ -1,4 +1,4 @@
-//! Postfilter (`func_c86e`).
+//! Postfilter.
 //!
 //! Operates on half-frame units (160 samples). Two IIR stages — forward and
 //! reverse — perform formant emphasis + tilt + output-gain correction.

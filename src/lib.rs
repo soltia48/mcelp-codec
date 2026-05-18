@@ -250,15 +250,15 @@ impl Codec {
             };
 
             // 6d. Gain — normal orchestrate or suppress decay
-            // Branches based on `mem[0x6f18]` (suppress flag) at the beginning of `func_d1ac` in asm.c:
+            // Branches based on suppress flag:
             // - Non-zero: gain_suppress_decay (threshold +1, multiply gains by decay factor)
             // - Zero:   Normal orchestrate (= gain_orchestrate_codec)
             let (pitch_gain, fcb_gain) = if effective_suppress {
                 let decay =
                     gain::gain_suppress_decay(threshold, self.dec.prev_pitch_gain, fcb_gain_state);
                 threshold = decay.threshold_out;
-                // For the suppress=1 path, the update logic for counter/history in asm.c
-                // is separate (= via func_d199). In the minimal implementation, the current state is maintained.
+                // For the suppress=1 path, the update logic for counter/history
+                // is separate. In the minimal implementation, the current state is maintained.
                 (decay.pitch_gain_out, decay.fcb_gain_out)
             } else {
                 let gain_out = gain::gain_orchestrate_codec(&gain::GainOrchestrateCodecInput {

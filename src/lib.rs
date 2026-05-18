@@ -155,17 +155,29 @@ impl Codec {
         // 6. Per-subframe synthesis
         let mut synth_pcm = [0i16; 320]; // Q15 PCM
         // gain pipeline persistent state (frame-local)
-        let mut threshold = 0i16;
-        let mut counter = 0i16;
+        let mut threshold = self.dec.gain_threshold;
+        let mut counter = self.dec.gain_counter;
         let mut history = self.dec.gain_history;
+        let mut lag_cursor = self.dec.lag_cursor;
+        let mut fcb_gain_state = self.dec.prev_fcb_gain;
 
         for i in 0..4 {
-            let block_phase = if i % 2 == 0 { 0i16 } else { 80 };
-            let _ = block_phase;
-            let lag_int = pitch_lags[i].lag;
-            let sub_lag = pitch_lags[i].sub_lag;
+            // 6a. Lag selection
+            // - suppress=0: Use pitch_lags[i] already decoded by decode_subframe_lag,
+            //   and update lag_cursor with selected_lag.
+            // - suppress=1: Do not call ce3e; use lag_cursor as the selected lag.
+            //   sub_lag is 0, cursor is +1 for the next sub (cap 143).
+            let (lag_int, sub_lag) = if ctrl.suppress {
+                let lag = lag_cursor;
+                lag_cursor = ((lag_cursor as i32) + 1).min(143) as i16;
+                (lag, 0i16)
+            } else {
+                let pl = pitch_lags[i];
+                lag_cursor = pl.lag;
+                (pl.lag, pl.sub_lag)
+            };
 
-            // 6a. Adaptive codebook (pitch_adaptive_codebook)
+            // 6b. Adaptive codebook (pitch_adaptive_codebook)
             let (fract, lag_adjust) = pitch::decode_lag_fract(sub_lag);
             let effective_lag = (lag_int as i32).wrapping_add(lag_adjust as i32);
             let write_offset = state::PAST_EXCITATION_OUTPUT_BASE; // = 160
@@ -188,7 +200,7 @@ impl Codec {
                 );
             }
 
-            // 6b. Fixed codebook (dispatch + short or main path)
+            // 6c. Fixed codebook (dispatch + short or main path)
             let dispatch = fcb::fcb_dispatch_lag_class(fcb_indices[i]);
             // pitch_enhance gain — via update_synth_control. `clamp_input` is the
             // output of levinson_recursion (= already computed from each sub's autocorrelation window).
@@ -217,30 +229,49 @@ impl Codec {
                 )
             };
 
-            // 6c. Gain pipeline orchestrator
-            let gain_out = gain::gain_orchestrate_codec(&gain::GainOrchestrateCodecInput {
-                phase_word: gain_phases[i],
-                threshold_in: threshold,
-                counter_in: counter,
-                candidate: c,
-                history,
-            });
-            let pitch_gain = gain_out.pitch_gain;
-            let fcb_gain = gain_out.fcb_gain;
-            history = gain_out.history_out;
-            threshold = gain_out.threshold_out;
-            counter = gain_out.counter_out;
+            // 6d. Gain — normal orchestrate or suppress decay
+            // Branches based on `mem[0x6f18]` (suppress flag) at the beginning of `func_d1ac` in asm.c:
+            // - Non-zero: gain_suppress_decay (threshold +1, multiply gains by decay factor)
+            // - Zero:   Normal orchestrate (= gain_orchestrate_codec)
+            let (pitch_gain, fcb_gain) = if ctrl.suppress {
+                let decay =
+                    gain::gain_suppress_decay(threshold, self.dec.prev_pitch_gain, fcb_gain_state);
+                threshold = decay.threshold_out;
+                // For the suppress=1 path, the update logic for counter/history in asm.c
+                // is separate (= via func_d199). In the minimal implementation, the current state is maintained.
+                (decay.pitch_gain_out, decay.fcb_gain_out)
+            } else {
+                let gain_out = gain::gain_orchestrate_codec(&gain::GainOrchestrateCodecInput {
+                    phase_word: gain_phases[i],
+                    threshold_in: threshold,
+                    counter_in: counter,
+                    candidate: c,
+                    history,
+                });
+                history = gain_out.history_out;
+                threshold = gain_out.threshold_out;
+                counter = gain_out.counter_out;
+                (gain_out.pitch_gain, gain_out.fcb_gain)
+            };
             // commit_pitch_gain — used by the next sub's compute_pitch_enhance_gain.
             self.dec.prev_pitch_gain = pitch_gain;
+            fcb_gain_state = fcb_gain;
 
-            // 6d. Excitation mix
-            let e = synth::mix_excitation(&v, &c, pitch_gain, fcb_gain);
+            // 6e. Excitation mix
+            // - normal: pitch_gain × v + fcb_gain × c (standard call to mix_excitation)
+            // - suppress=1 / phase_ctl=0: Sets the pitch component to 0 and scales only the fcb output
+            //   The path where phase_ctl != 0 is decoder-only and does not trigger.
+            let e = if ctrl.suppress {
+                synth::mix_excitation(&v, &c, 0, fcb_gain)
+            } else {
+                synth::mix_excitation(&v, &c, pitch_gain, fcb_gain)
+            };
             // Write back to past_excitation
             for n in 0..80 {
                 self.dec.past_excitation[sub_write_offset + n] = e[n];
             }
 
-            // 6e. LPC synthesis filter (1/A(z))
+            // 6f. LPC synthesis filter (1/A(z))
             // Pass cells [1..11] / [12..22] of the autocorrelation window from
             // build_autocorrelation_with_state directly as the 10-tap LPC
             // (= Levinson is already done inside response_shaper).
@@ -254,7 +285,7 @@ impl Codec {
                 synth_pcm[pcm_offset + n] = s_hat[n];
             }
 
-            // 6f. Block-end past_excitation shift (after sub 1 and sub 3)
+            // 6g. Block-end past_excitation shift (after sub 1 and sub 3)
             if i % 2 == 1 {
                 // Shift [160..320] → [0..160], clear [160..320]
                 for k in 0..160 {
@@ -270,6 +301,8 @@ impl Codec {
         self.dec.gain_history = history;
         self.dec.gain_threshold = threshold;
         self.dec.gain_counter = counter;
+        self.dec.lag_cursor = lag_cursor;
+        self.dec.prev_fcb_gain = fcb_gain_state;
 
         // 7. Postfilter (per half-frame × 2)
         let mut postfiltered = [0i16; 320];

@@ -143,10 +143,19 @@ LSF (F[0..1]) はフレームに 1 度だけ送られ、両ブロックがロー
 3. `[139..143)` のビットをクリア
 
 正規化後、デコーダは bit 138 から `suppress` を読み取り、これは
-`ControlFrame.suppress` として公開されます。現状のクレートは
-非 suppress (`= 0`) パスを復号しています — フィールドはパースされて
-呼び出し側に提供されますが、suppress=1 の代替ゲインパスはまだデコーダで
-実行されません。
+`ControlFrame.suppress` として公開されます。両方の分岐が実装されています。
+
+- **suppress = 0** (通常経路): ピッチ lag は `decode_subframe_lag` で復号され、
+  ゲインは `gain_orchestrate_codec` で生成されます
+  ([excitation.md](excitation.md)、[gain.md](gain.md) を参照)。
+- **suppress = 1** (コンシールメント / グリッチマスキング経路):
+  サブフレームループは `decode_subframe_lag` と `gain_orchestrate_codec` を
+  バイパスします。代わりに `state.lag_cursor` をサブフレームごとに +1
+  進め (上限 143、`sub_lag = 0`)、`gain_suppress_decay` で前サブフレームの
+  `(g_p, g_c)` を Q15 倍率で減衰させます (内部しきい値が 4 に達すると
+  減衰が強くなります)。さらに `mix_excitation` 内でピッチ成分も 0 に
+  置き換えられるため、この経路では減衰された FCB 寄与のみが残ります。
+  詳細は [gain.md §6](gain.md#6-suppress1-の代替ゲイン経路) を参照。
 
 ### 3.3 リセットフレーム
 

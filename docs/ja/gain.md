@@ -189,10 +189,80 @@ return (デケイ適用済, counter_out)
 `counter_out` も 0 のままなので、テールデケイブロックは素通りで
 `(g_p, g_c) = (update_base, initial_gain)` となります。
 
-## 6. 配線
+> **命名についての注意。** 上で言及した「テールデケイ」は
+> `gain_orchestrate_codec` の内部処理で、ビットストリームの `suppress`
+> フラグに関係なくすべてのサブフレームで実行されます。一方、
+> `suppress=1` のときに使われる代替ゲイン経路 (§6 参照) は完全に別物で、
+> `gain_orchestrate_codec` をまったく呼ばず、独自の減衰ルーチンを使います。
 
-サブフレームごとに出力される 4 つのゲイン結果は、[src/lib.rs](../../src/lib.rs)
-で次のように接続されます。
+## 6. suppress=1 の代替ゲイン経路
+
+ビットストリームの `suppress` フラグ (bit 138 — 詳細は
+[architecture.md](architecture.md#32-suppress-フラグと-flag-source-ビット)
+を参照) が立っているとき、サブフレームごとのゲインパイプラインは
+`gain_orchestrate_codec` を **呼びません**。代わりに `gain_suppress_decay`
+を呼び、前サブフレームのゲインを固定係数で減衰させます。
+
+```rust
+struct GainSuppressDecay {
+    threshold_out: i16,
+    pitch_gain_out: i16,
+    fcb_gain_out:  i16,
+}
+
+fn gain_suppress_decay(
+    threshold:     i16,
+    pitch_gain_in: i16,   // = self.dec.prev_pitch_gain
+    fcb_gain_in:   i16,   // = フレームローカル fcb_gain_state (prev_fcb_gain で初期化)
+) -> GainSuppressDecay
+```
+
+減衰の係数は *古い* `threshold` の値によって決まります。
+
+| `threshold` | 倍率 (Q15)              | 飽和上限 |
+| ----------- | ----------------------- | -------- |
+| `< 4`       | `31470 / 32768 ≈ 0.960` | 32113    |
+| `≥ 4`       | `26542 / 32768 ≈ 0.810` | 29491    |
+
+`threshold_out = threshold + 1` — `threshold` は suppress=1 のサブフレーム
+ごとに 1 ずつ増え、4 サブフレーム経過すると「強い」減衰モードに切り替わります。
+この加算はラップ算術なので、suppress=1 が長く続けばいずれラップして弱減衰モード
+に戻ります。実用上 suppress=1 は短期間しか続かないため (コンシールメント /
+グリッチマスキング)、ラップは発生しません。
+
+サブフレームループでは次のように接続されます。
+
+```
+let (pitch_gain, fcb_gain) = if ctrl.suppress {
+    let d = gain_suppress_decay(threshold, prev_pitch_gain, fcb_gain_state);
+    threshold = d.threshold_out;
+    (d.pitch_gain_out, d.fcb_gain_out)
+} else {
+    // §1–5 の gain_orchestrate_codec
+    …
+};
+```
+
+入力 `prev_pitch_gain` と `prev_fcb_gain` はフレーム間で `DecoderState`
+に永続化されます ([state.md](state.md#1-decoderstate-構造体) 参照)。
+`counter` および 5 セルの `gain_history` リングは suppress=1 経路では
+意図的に **更新されません** — asm リファレンスではこれらを別ルーチン
+(本最小実装ではまだモデル化していない) で更新します。
+
+ゲイン減衰後、励振ミキシングも suppress=1 では変化します。
+
+```
+e[n] = mix_excitation(v, c, /* pitch_gain */ 0, fcb_gain)
+```
+
+— ピッチ成分は 0 に置き換えられ、FCB 出力のみがスケーリングされます。これは
+asm で `phase_ctl == 0` の分岐がピッチ入力をクリアしてから `mix_excitation`
+を呼び出す経路に対応します。
+
+## 7. 配線
+
+サブフレームごとに出力される 4 つのゲイン結果 (通常経路) は、
+[src/lib.rs](../../src/lib.rs) で次のように接続されます。
 
 ```
 pitch_gain   = tail.update_base_out   → mix_excitation
@@ -201,6 +271,18 @@ threshold    = tail.threshold_out     → 次サブフレームへ
 counter      = tail.counter_out       → 次サブフレームへ
 history_out[5] → 次サブフレームへ (フレーム末でフレーム永続)
 prev_pitch_gain = pitch_gain          → 次サブフレームの compute_pitch_enhance_gain
+prev_fcb_gain   = fcb_gain            → 次フレームの suppress=1 デケイ (state.prev_fcb_gain)
+```
+
+suppress=1 経路では配線は次のように単純化されます。
+
+```
+pitch_gain   = decay.pitch_gain_out   → mix_excitation (ただし 0 倍される)
+fcb_gain     = decay.fcb_gain_out     → mix_excitation
+threshold    = decay.threshold_out    → 次サブフレームへ (= threshold + 1)
+counter, history                      → 変更なし
+prev_pitch_gain = pitch_gain          → 次サブフレームの compute_pitch_enhance_gain
+prev_fcb_gain   = fcb_gain            → 次サブフレームの gain_suppress_decay 入力
 ```
 
 **コミット順序** に注目してください: `prev_pitch_gain` はゲインオーケストレーション
@@ -208,9 +290,14 @@ prev_pitch_gain = pitch_gain          → 次サブフレームの compute_pitch
 これは必須で、ピッチ強調ゲインが synth-control ヒステリシスを通じて前ピッチゲインに
 依存するためです ([synthesis.md](synthesis.md#1-synth-control-ピッチ強調のゲーティング) を参照)。
 
-## 7. 初期状態
+## 8. 初期状態
 
 コーデック初期化時、`gain_history` は `[-17254, -17254, -17254, -17254, 0]` に
 セットされ、`gain_threshold = gain_counter = 0` となります。非ゼロの履歴は AR
 予測子に小さな負のバイアスを与え、静的なピッチゲイン包絡を近似します — これが
 ないと、最初の数フレームは履歴が実値で埋まるまで予測が大きく外れます。
+
+suppress=1 のデケイ入力 `prev_pitch_gain` と `prev_fcb_gain` はいずれも `0` で
+初期化されます — したがって、通常フレームを 1 つも処理せずにいきなり suppress=1
+のフレームが到着した場合は、ゼロを減衰させて無音を出力することになります
+(これが望ましいフォールバック挙動です)。

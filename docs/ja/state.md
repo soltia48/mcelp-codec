@@ -24,6 +24,8 @@ pub struct DecoderState {
     pub postfilter_delay:          [i16; 12],            // 前向き+後ろ向き 3 セクションのディレイ
     pub prev_lag:                  i16,                  // 直近ブロックで選択された lag (synth control)
     pub prev_pitch_gain:           i16,                  // 直近サブフレームの g_p (synth control)
+    pub prev_fcb_gain:             i16,                  // 直近サブフレームの g_c (suppress=1 デケイ入力)
+    pub lag_cursor:                i16,                  // suppress=1 経路用の lag カーソル
     pub response_shaper_buffer:    [i16; 35],            // パス間で持ち越す dword スクラッチ
     pub prev_lpc_stability_flag:   i16,                  // 0/1 — block-0 オーバライドのエッジ判定用
 }
@@ -49,7 +51,9 @@ DecoderState::new() = {
     postfilter_history   = [0; 6]
     postfilter_delay     = [0; 12]
     prev_lag             = 60
-    prev_pitch_gain      = 3277
+    prev_pitch_gain      = 0
+    prev_fcb_gain        = 0
+    lag_cursor           = 60
     response_shaper_buffer = [0; 35]
     prev_lpc_stability_flag = 0
 }
@@ -66,8 +70,14 @@ DecoderState::new() = {
 - `gain_history` は `-17254` を 4 回繰り返してゼロパディングした 5 番目の
   スロットでシードされます。これは平均的な過去ゲイン予測状態を近似する
   小さな負のバイアスで、これがないと最初の数フレームの予測が大幅に外れます。
-- `prev_lag = 60` と `prev_pitch_gain = 3277` は、起動時に synth-control
-  ヒステリシスを安定した中間状態にするための静的な値です。
+- `prev_lag = 60` は、起動時に synth-control ヒステリシスを安定した
+  中間状態にするための静的な値です。`prev_pitch_gain = 0` でも安全なのは、
+  `update_synth_control` が前制御状態を読む前に `MIN_SYNTH_STATE = 3277`
+  までクランプアップするためです
+  ([synthesis.md](synthesis.md#1-synth-control-ピッチ強調のゲーティング) 参照)。
+- `lag_cursor = 60` は `prev_lag` と同じ値を取り、normal な frame より先に
+  suppress=1 のフレームが来た場合でも、最初の lag が 60 で始まるように
+  suppress=1 の lag ウォーカーをシードします。
 
 ## 3. フレーム内の状態の流れ
 
@@ -85,7 +95,10 @@ DecoderState::new() = {
 5. **サブフレームごと** (i = 0..3):
    - `past_excitation[write_offset + n]` ← `e[n]`
    - `lpc_synth_history` ← `s_hat` の最後 10 サンプル
-   - `prev_pitch_gain` ← `gain_out.pitch_gain`
+   - `prev_pitch_gain` ← そのサブフレームのピッチゲイン (normal:
+     `gain_out.pitch_gain`、suppress=1: `gain_suppress_decay` のデケイ後値)
+   - `lag_cursor` と `prev_fcb_gain` はフレームローカルに追跡され、
+     フレーム末でコミットされる (ステップ 7 参照)
 6. **ブロックごと** (sub 1 と sub 3 の後):
    - `past_excitation[160..320]` を `[0..160]` にシフトし、`[160..320]` を
      クリア
@@ -93,6 +106,10 @@ DecoderState::new() = {
 7. **フレームごと** (最終サブフレームの後):
    - `gain_history`, `gain_threshold`, `gain_counter` ← ゲインオーケストレータの
      出力から
+   - `lag_cursor` ← 通常経路では最終サブフレームの `selected_lag`、
+     suppress=1 経路ではフレーム末のウォーカーカーソル
+   - `prev_fcb_gain` ← 最終サブフレームの $g_c$ (次フレームの suppress=1
+     デケイ入力として使用)
    - `postfilter_history`, `postfilter_delay` ← `postfilter_apply` から
      (in-place)
 
@@ -135,9 +152,11 @@ DecoderState::new() = {
 | `past_excitation`           | サブ毎        | `pitch_adaptive_codebook` 内 + 混合の後          |
 | `past_excitation` (シフト)  | ブロック毎    | サブフレーム 1 とサブフレーム 3 の後              |
 | `lpc_synth_history`         | サブ毎        | `lpc_synthesis_filter` の後                      |
-| `prev_pitch_gain`           | サブ毎        | `gain_orchestrate_codec` の後                    |
+| `prev_pitch_gain`           | サブ毎        | ゲインパイプライン (normal / suppress) の後       |
+| `prev_fcb_gain`             | サブ毎        | フレームローカルで追跡、最終コミットはフレーム毎 |
+| `lag_cursor`                | サブ毎        | normal: ← `selected_lag`、suppress=1: ← カーソル+1 (上限 143) |
 | `prev_lag`                  | ブロック毎    | サブフレーム 1 とサブフレーム 3 の後              |
 | `gain_history`              | サブ毎        | `gain_history_update` 内、最終コミットはフレーム毎 |
-| `gain_threshold/counter`    | サブ毎        | `gain_tail_decay` 内、最終コミットはフレーム毎    |
+| `gain_threshold/counter`    | サブ毎        | normal は `gain_tail_decay` 内、suppress=1 は `gain_suppress_decay` 内、最終コミットはフレーム毎 |
 | `postfilter_history/delay`  | ハーフフレーム毎 | `postfilter_apply` 内                           |
-| `pitch_state_block{0,1}`    | サブ毎        | `decode_subframe_lag` 内                         |
+| `pitch_state_block{0,1}`    | サブ毎        | `decode_subframe_lag` 内 (suppress=0 のときのみ) |

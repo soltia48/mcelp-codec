@@ -199,9 +199,81 @@ In the steady state (no suppress), `threshold_in` is 0 across all
 subframes and `counter_out` stays 0, so the tail-decay block is a pass-
 through and `(g_p, g_c) = (update_base, initial_gain)`.
 
-## 6. Wiring
+> **Naming note.** "Tail decay" above is internal to
+> `gain_orchestrate_codec` and runs on every subframe regardless of the
+> bitstream `suppress` flag. The completely separate `suppress=1`
+> alternative gain path (see §6 below) skips `gain_orchestrate_codec`
+> entirely and uses its own decay routine.
 
-The four gain results emitted per subframe are wired in
+## 6. Suppress=1 alternative gain path
+
+When the bitstream's `suppress` flag is set (bit 138 — see
+[architecture.md](architecture.md#32-suppress-flag-and-flag-source-bit)),
+the per-subframe gain pipeline does **not** call
+`gain_orchestrate_codec`. Instead it calls `gain_suppress_decay`, which
+attenuates the previous subframe's gains by a fixed factor:
+
+```rust
+struct GainSuppressDecay {
+    threshold_out: i16,
+    pitch_gain_out: i16,
+    fcb_gain_out:  i16,
+}
+
+fn gain_suppress_decay(
+    threshold:     i16,
+    pitch_gain_in: i16,   // = self.dec.prev_pitch_gain
+    fcb_gain_in:   i16,   // = frame-local fcb_gain_state (init from prev_fcb_gain)
+) -> GainSuppressDecay
+```
+
+The decay constants depend on the *old* threshold value:
+
+| `threshold` | Multiplier (Q15)        | Saturation cap |
+| ----------- | ----------------------- | -------------- |
+| `< 4`       | `31470 / 32768 ≈ 0.960` | 32113          |
+| `≥ 4`       | `26542 / 32768 ≈ 0.810` | 29491          |
+
+`threshold_out = threshold + 1` — the threshold is incremented each
+suppress=1 subframe, so once 4 suppress=1 subframes have elapsed the
+"strong" decay kicks in. The increment uses wrapping arithmetic, so
+sustained suppress=1 frames eventually wrap and re-enter the weak-decay
+regime; in practice suppress=1 is short-lived (concealment / glitch
+masking) so the wrap is not exercised.
+
+In the per-subframe loop this is wired as:
+
+```
+let (pitch_gain, fcb_gain) = if ctrl.suppress {
+    let d = gain_suppress_decay(threshold, prev_pitch_gain, fcb_gain_state);
+    threshold = d.threshold_out;
+    (d.pitch_gain_out, d.fcb_gain_out)
+} else {
+    // gain_orchestrate_codec as in §1–5
+    …
+};
+```
+
+The state inputs `prev_pitch_gain` and `prev_fcb_gain` are persisted
+across frames in `DecoderState` (see
+[state.md](state.md#1-the-decoderstate-struct)). `counter` and the
+`gain_history` 5-cell ring are intentionally **not** touched by the
+suppress=1 path — the asm reference updates them through a separate
+routine that this minimal implementation does not yet model.
+
+After the gain decay, the excitation mix is also altered for suppress=1:
+
+```
+e[n] = mix_excitation(v, c, /* pitch_gain */ 0, fcb_gain)
+```
+
+— the pitch component is zeroed and only the FCB output is scaled. This
+matches the asm path where the `phase_ctl == 0` branch nulls the pitch
+input before calling `mix_excitation`.
+
+## 7. Wiring
+
+The four gain results emitted per subframe (normal path) are wired in
 [src/lib.rs](../../src/lib.rs) as:
 
 ```
@@ -211,6 +283,18 @@ threshold    = tail.threshold_out     → next subframe
 counter      = tail.counter_out       → next subframe
 history_out[5] → next subframe (frame-persistent at frame end)
 prev_pitch_gain = pitch_gain          → next subframe's compute_pitch_enhance_gain
+prev_fcb_gain   = fcb_gain            → next frame's suppress=1 decay (state.prev_fcb_gain)
+```
+
+For the suppress=1 path the wiring degenerates to:
+
+```
+pitch_gain   = decay.pitch_gain_out   → mix_excitation (but multiplied by 0)
+fcb_gain     = decay.fcb_gain_out     → mix_excitation
+threshold    = decay.threshold_out    → next subframe (= threshold + 1)
+counter, history                      → unchanged
+prev_pitch_gain = pitch_gain          → next subframe's compute_pitch_enhance_gain
+prev_fcb_gain   = fcb_gain            → next subframe's gain_suppress_decay input
 ```
 
 Notice the **commit ordering**: `prev_pitch_gain` is updated *after*
@@ -219,10 +303,15 @@ gain orchestration but *before* the next subframe's
 pitch-enhance gain depends on the previous pitch gain via the synth-
 control hysteresis (see [synthesis.md](synthesis.md#synth-control)).
 
-## 7. Initial state
+## 8. Initial state
 
 At codec init `gain_history` is set to `[-17254, -17254, -17254, -17254,
 0]` and `gain_threshold = gain_counter = 0`. The non-zero history
 seeds the AR predictor with a small negative bias that approximates the
 quiescent pitch-gain envelope — without it, the first few decoded frames
 would mispredict severely until the history fills with real values.
+
+The suppress=1 decay inputs `prev_pitch_gain` and `prev_fcb_gain` are
+both initialised to `0` — so the very first frame that arrives with
+suppress=1 (without any preceding normal frame) decays zeros and emits
+silence, which is the desired fallback.

@@ -145,10 +145,22 @@ The receiver canonicalises the frame (see
 3. clearing bits `[139..143)`.
 
 After canonicalisation the decoder reads `suppress` from bit 138, which is
-exposed as `ControlFrame.suppress`. The current crate decodes the
-non-suppress (`= 0`) path — the field is parsed and kept available to the
-caller, but the suppress=1 alternative-gain path is not exercised by the
-decoder yet.
+exposed as `ControlFrame.suppress`. Both branches are now implemented:
+
+- **suppress = 0** (normal path): pitch lags are decoded by
+  `decode_subframe_lag` and gains are produced by
+  `gain_orchestrate_codec`, as documented in
+  [excitation.md](excitation.md) and [gain.md](gain.md).
+- **suppress = 1** (concealment / glitch-masking path): the per-subframe
+  loop bypasses `decode_subframe_lag` and `gain_orchestrate_codec`.
+  Instead it walks `state.lag_cursor` forward by 1 each subframe
+  (saturating at 143, with `sub_lag = 0`), and runs
+  `gain_suppress_decay` over the previous subframe's `(g_p, g_c)` —
+  attenuating both gains by a Q15 factor that strengthens once the
+  internal threshold reaches 4. Inside `mix_excitation` the pitch
+  component is also zeroed for this path, so only the decayed FCB
+  contribution survives. Details in
+  [gain.md §6](gain.md#6-suppress1-alternative-gain-path).
 
 ### 3.3 Reset frame
 

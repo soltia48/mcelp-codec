@@ -24,6 +24,8 @@ pub struct DecoderState {
     pub postfilter_delay:          [i16; 12],            // forward+reverse 3-section delays
     pub prev_lag:                  i16,                  // last-block selected lag (synth control)
     pub prev_pitch_gain:           i16,                  // last-subframe g_p (synth control)
+    pub prev_fcb_gain:             i16,                  // last-subframe g_c (suppress=1 decay input)
+    pub lag_cursor:                i16,                  // running lag cursor for the suppress=1 path
     pub response_shaper_buffer:    [i16; 35],            // dword scratch carried across passes
     pub prev_lpc_stability_flag:   i16,                  // 0/1 — for block-0 override edge
 }
@@ -49,7 +51,9 @@ DecoderState::new() = {
     postfilter_history   = [0; 6]
     postfilter_delay     = [0; 12]
     prev_lag             = 60
-    prev_pitch_gain      = 3277
+    prev_pitch_gain      = 0
+    prev_fcb_gain        = 0
+    lag_cursor           = 60
     response_shaper_buffer = [0; 35]
     prev_lpc_stability_flag = 0
 }
@@ -69,9 +73,14 @@ A few non-zero seeds are worth calling out:
   zero-padded fifth slot. This is a small negative bias that
   approximates the mean past-gain prediction state — without it, the
   first few frames mispredict drastically.
-- `prev_lag = 60` and `prev_pitch_gain = 3277` are quiescent values
-  that put the synth-control hysteresis in a stable mid-state on
-  startup.
+- `prev_lag = 60` is a quiescent value that puts the synth-control
+  hysteresis in a stable mid-state on startup. `prev_pitch_gain = 0` is
+  also safe because `update_synth_control` clamps it up to
+  `MIN_SYNTH_STATE = 3277` before reading the previous control state
+  (see [synthesis.md](synthesis.md#synth-control)).
+- `lag_cursor = 60` mirrors `prev_lag` and seeds the suppress=1 lag
+  walker so its first emitted lag is also 60 if a suppress=1 frame
+  arrives before any normal frame.
 
 ## 3. State flow per frame
 
@@ -90,7 +99,11 @@ Within a frame, state is updated in this order:
 5. **Per-subframe** (i = 0..3):
    - `past_excitation[write_offset + n]` ← `e[n]`
    - `lpc_synth_history` ← last 10 samples of `s_hat`
-   - `prev_pitch_gain` ← `gain_out.pitch_gain`
+   - `prev_pitch_gain` ← the subframe's pitch gain (normal:
+     `gain_out.pitch_gain`; suppress=1: the decayed value from
+     `gain_suppress_decay`)
+   - `lag_cursor`, `prev_fcb_gain` are tracked frame-locally and
+     committed at frame end (see step 7)
 6. **Per-block** (after sub 1 and sub 3):
    - shift `past_excitation[160..320]` → `[0..160]`, clear
      `[160..320]`
@@ -98,6 +111,10 @@ Within a frame, state is updated in this order:
 7. **Per-frame** (after the last subframe):
    - `gain_history`, `gain_threshold`, `gain_counter` ← from the gain
      orchestrator's outputs
+   - `lag_cursor` ← either the normal-path `selected_lag` of the last
+     subframe, or the suppress=1 walker's cursor at frame end
+   - `prev_fcb_gain` ← the last subframe's $g_c$ (used as the next
+     frame's suppress=1 decay input)
    - `postfilter_history`, `postfilter_delay` ← from
      `postfilter_apply` (in place)
 
@@ -143,9 +160,11 @@ A few state fields *look* like scratch but are persisted across calls:
 | `past_excitation`         | per sub    | inside `pitch_adaptive_codebook` and after mix    |
 | `past_excitation` (shift) | per block  | after subframe 1 and subframe 3                   |
 | `lpc_synth_history`       | per sub    | after `lpc_synthesis_filter`                      |
-| `prev_pitch_gain`         | per sub    | after `gain_orchestrate_codec`                    |
+| `prev_pitch_gain`         | per sub    | after gain pipeline (normal or suppress)          |
+| `prev_fcb_gain`           | per sub    | tracked frame-local; final commit per frame       |
+| `lag_cursor`              | per sub    | normal: ← `selected_lag`; suppress=1: ← cursor+1 (cap 143) |
 | `prev_lag`                | per block  | after subframe 1 and subframe 3                   |
 | `gain_history`            | per sub    | inside `gain_history_update`; final commit per frame |
-| `gain_threshold/counter`  | per sub    | inside `gain_tail_decay`; final commit per frame  |
+| `gain_threshold/counter`  | per sub    | inside `gain_tail_decay` (normal) or `gain_suppress_decay` (suppress=1); final commit per frame  |
 | `postfilter_history/delay`| per half-frame | inside `postfilter_apply`                     |
-| `pitch_state_block{0,1}`  | per sub    | inside `decode_subframe_lag`                      |
+| `pitch_state_block{0,1}`  | per sub    | inside `decode_subframe_lag` (only when suppress=0) |

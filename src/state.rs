@@ -49,6 +49,12 @@ pub struct DecoderState {
     /// Post-orchestrate pitch_gain of the previous subframe. Used by
     /// `compute_pitch_enhance_gain`. codec init: 3277.
     pub prev_pitch_gain: i16,
+    /// The post-orchestrate fcb_gain from the previous subframe. For the suppress=1 path
+    pub prev_fcb_gain: i16,
+    /// A lag cursor specific to the suppress=1 path. When suppress=1,
+    /// this value is used and incremented by +1 per subframe (saturates at 143). In the normal path,
+    /// this is overwritten by the selected_lag of each subframe.
+    pub lag_cursor: i16,
     /// `response_shaper` dword scratch buffer. Called 3 times per frame
     /// (stability-check pass → block 0 → block 1); state is carried across passes.
     /// codec init: all zero.
@@ -80,7 +86,9 @@ impl DecoderState {
             postfilter_history: [0; 6],
             postfilter_delay: [0; 12],
             prev_lag: 60,
-            prev_pitch_gain: 3277,
+            prev_pitch_gain: 0,
+            prev_fcb_gain: 0,
+            lag_cursor: 60,
             response_shaper_buffer: [0; 35],
             prev_lpc_stability_flag: 0,
         }

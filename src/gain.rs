@@ -5,6 +5,43 @@ use crate::tables::gain::{
     COEFF_TABLE, PHASE_TABLE, PREDICT_NORMALIZE_TABLE, PREDICT_SECONDARY_TABLE,
 };
 
+/// Output of the branch with suppress=1.
+#[derive(Clone, Copy, Debug)]
+pub struct GainSuppressDecay {
+    pub threshold_out: i16,
+    pub pitch_gain_out: i16,
+    pub fcb_gain_out: i16,
+}
+
+///  suppress=1 branch — Attenuation of gain values.
+///
+/// - `threshold < 4`: gain *= 31470/32768 ≈ 0.960, upper limit 32113
+/// - `threshold >= 4`: gain *= 26542/32768 ≈ 0.810, upper limit 29491
+/// - `threshold_out = threshold + 1` (= increased by one in the BCD delay slot in asm)
+pub fn gain_suppress_decay(
+    threshold: i16,
+    pitch_gain_in: i16,
+    fcb_gain_in: i16,
+) -> GainSuppressDecay {
+    // If the old threshold is 4 or higher, take the strong decay path.
+    let use_strong = threshold >= 4;
+    let coeff: i16 = if use_strong { 26542 } else { 31470 };
+    let cap: i16 = if use_strong { 29491 } else { 32113 };
+
+    // gain *= coeff (Q15 × Q15 → Q30 → take hi16 = Q15).
+    let decay = |gain: i16| -> i16 {
+        let prod: i32 = (gain as i32) * (coeff as i32);
+        let q15: i32 = prod >> 15;
+        q15.min(cap as i32) as i16
+    };
+
+    GainSuppressDecay {
+        threshold_out: threshold.wrapping_add(1),
+        pitch_gain_out: decay(pitch_gain_in),
+        fcb_gain_out: decay(fcb_gain_in),
+    }
+}
+
 #[derive(Clone, Copy, Debug)]
 pub struct GainPhaseSetup {
     pub acc_main: i64,

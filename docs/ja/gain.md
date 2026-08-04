@@ -1,303 +1,75 @@
-# ゲイン量子化
+# 利得
 
-各サブフレームのピッチゲイン $g_p$ と FCB ゲイン $g_c$ は、ビットストリームの
-F[4], F[7], F[10], F[13] が運ぶ **7 ビットの位相ワード** に共同で符号化されます。
-復号側でそれらを復元するのは単純ではありません — 位相テーブル参照、いくつかの
-固定テーブルを辿る予測リフレッシュ、予測状態の指数的履歴更新、そして
-しきい値駆動のテールデケイリミッタを伴います。
-
-本ドキュメントはそのパイプラインを順に解説します。
-ソース: [src/gain.rs](../../src/gain.rs), [src/tables/gain.rs](../../src/tables/gain.rs)。
-オーケストレータのエントリーポイントは `gain_orchestrate_codec` です。
-
-## 1. 入出力
-
-### 入力
-
-```rust
-struct GainOrchestrateCodecInput {
-    phase_word:    i16,    // ビットストリームからの 7 ビットフィールド
-    threshold_in:  i16,    // テールデケイのしきい値 (フレーム永続)
-    counter_in:    i16,    // テールデケイのカウンタ (フレーム永続)
-    candidate:     [i16; 80], // このサブフレームの FCB 出力 c[n]
-    history:       [i16; 5],  // 過去ゲイン履歴 (フレーム永続)
-}
-```
-
-### 出力
-
-```rust
-struct GainOrchestrateOutput {
-    pitch_gain:     i16,   // g_p, mix_excitation の pitch_gain として渡す
-    fcb_gain:       i16,   // g_c, mix_excitation の fcb_gain として渡す
-    history_out:    [i16; 5],
-    threshold_out:  i16,
-    counter_out:    i16,
-}
-```
-
-`phase_word` は両ゲインで共有されます — つまりエンコーダはサブフレームごとに
-1 つの 7 ビットインデックスを送出し、それが共同量子化された 128 個の
-`(g_p, g_c)` のペアの中から 1 つを選択します。他の入力は、サブフレーム単位で
-更新されるフレームごとの状態 ([state.md](state.md) 参照) から得られます。
-
-## 2. 位相セットアップ
-
-`gain_phase_setup(phase_word, …)` は位相ワードを 2 つの 4 ビット半分に分解し、
-それぞれを使って `PHASE_TABLE` の 2 セル ("upper" と "lower" のペア) を参照します。
+各サブフレームの励振は、2つの寄与に利得を掛けて足したものです。
 
 ```
-phase_first_idx  = (phase_word >> 4) << 1     // 0..14
-phase_second_idx = ((phase_word & 0xF) << 1) + 16   // 16..46
-
-phase_first_upper = PHASE_TABLE[phase_first_idx]
-phase_first_lower = PHASE_TABLE[phase_first_idx + 1]
-phase_second_upper= PHASE_TABLE[phase_second_idx]
-phase_second_lower= PHASE_TABLE[phase_second_idx + 1]
+励振 = gₚ · (適応コードブック) + g_c · (固定コードブック)
 ```
 
-`PHASE_TABLE` は [src/tables/gain.rs](../../src/tables/gain.rs) にある
-48 セルの量子化テーブルです。`phase_word` の **上位 3 ビット**
-(すなわち `phase_word >> 4`、範囲 0..7) が `PHASE_TABLE[0..16]` のセル対を
-選択し、**下位 4 ビット** (範囲 0..15) が `PHASE_TABLE[16..48]` のセル対を
-選択します。概念的には 2 つの半分は $g_c$ と $g_p$ の量子化値をそれぞれ
-運びますが、そのまま使われるのではなく、後段の予測リフレッシュを通します。
+両方の利得は**単一の7ビット索引**から得られます。別々に送らず同時に送るのは、
+両者が相関しているためです——強い有声サブフレームは大きなピッチ利得と小さな
+符号利得を求め、逆もまた然り——なので、同時コードブックは独立な2本より遥かに
+効率よく有用な領域を覆えます。
 
-`gain_phase_setup` は続いて以下を計算します。
+## 共役コードブック
 
-- `update_base = ((phase_first_upper + phase_first_lower) << 16) >> 16`
-  — $g_p$ の初期候補。
-- `saved_ah    = ((phase_second_upper + phase_second_lower) << 16) >> 16`
-  — 履歴セットアップに渡す簿記値。
-
-また、予測リフレッシュの入力となる位相ワードのビットでシードされた 2 つの
-i40 アキュムレータ (`acc_main`, `acc_scratch`) を導出します。
-
-## 3. 予測リフレッシュ
-
-`gain_predictive_refresh` が支配的な計算です。これは
-`history_shift_init` (整数のシフト数) と `history_sample_init` (Q15 サンプル) を
-生成し、両者でゲイン量子化器が正規化対象とする **励振リファレンスレベル** を
-定義します。関数の 10 フェーズはオリジナル DSP ルーチンを反映しますが、
-高レベルの構造は次のとおりです。
+7ビットは2段に分かれます。
 
 ```
-1. FCB 候補のエネルギー:
-       E = 10·2^17 + 2·Σ c[n]^2
-   (10·2^17 は小エネルギーの下限)
-2. PREDICT_NORMALIZE_TABLE に対する一次正規化
-       — 正規化エネルギーから参照インデックスを選び、
-         2 セル間を補間 (Q15 frac)。
-3. 線形補正 (19488<<19 を引き、18432<<20 を加える)。
-4. 過去ゲイン履歴との 4-tap 内積:
-       acc_main = Σ_{k=0..3} COEFF_TABLE[k] · history[k]
-   ここで COEFF_TABLE = [5571, 4096, 2703, 1311] は 4 極の AR 予測子。
-5. 結合 + 5439 倍率での混合 → history_shift_init。
-6. PREDICT_SECONDARY_TABLE に対する二次正規化
-       (一次と同じ形状、ただし係数が異なる)。
-7. history_sample_init = 二次後アキュムレータの上位 16 ビット。
+索引 = [ 3 ビット ][ 4 ビット ]
+          │           └── 第2段：16行 ×（ピッチ項, 符号項）
+          └────────────── 第1段： 8行 ×（ピッチ項, 符号項）
 ```
 
-2 つの正規化ステップは `gain_normalize_primary` と `gain_normalize_secondary`
-で実装されています。両者ともに **区分線形** な (異なる) 非線形関数の近似で、
-i40 アキュムレータの正規化された仮数部でインデックスする 33 セルの参照
-テーブルと、セル間を補間する Q15 の小数重みを持ちます。構造は次のとおり。
+2つの行を成分ごとに加算します。8 × 16 = 128 通りの組合せを、わずか24行の表
+から得ています。これが「共役」構造で、全数探索できるほど探索を安価にします。
+
+和の第1成分がピッチ利得で、そのまま使われます。第2成分は符号利得**ではありま
+せん**。*予測された*符号利得に掛ける補正係数です。
+
+## 符号利得を予測する理由
+
+固定コードブック利得は音声のダイナミックレンジ全体——無音から叫び声まで——を
+覆う必要があり、直接符号化すると多くのビットを要します。しかし予測しやすい量
+でもあります。今回のサブフレームで励振が必要とする電力は、励振自身の電力を
+勘案すれば、前サブフレームで必要だった値に近いのです。
+
+そこでコーダは予測します。
+
+1. 今回のサブフレームの励振の電力を取る；
+2. 直近4サブフレームの*予測誤差*の4タップ移動平均を取る（dB で保持）；
+3. 両者を合わせて、今回必要になるはずの利得を予測する；
+4. 送るのは補正係数だけ——実際の答えが予測からどれだけ離れているか。
+
+補正係数は利得そのものより遥かに狭い範囲に収まるので、4ビットのコードブックで
+運べます。予測器の記憶は、ストリームを途中から復号できなくする状態の1つです。
+過去4つの誤差を取り違えると、以降の符号利得はすべて狂います。
+
+ここでの計算はすべて対数領域で行われます。モジュールが `log2` と `2^x` の表を
+持つのはそのためです。利得は乗法的な量であり、dB で平均するということは実際に
+定常な量を平均するということです。
+
+## エンコーダ側の探索
+
+閉ループは、そのサブフレームを記述する5つの測度を残します。目標・適応寄与・
+固定寄与の間の、2つの電力と3つの相関です。候補ごとの符号化誤差は、2つの利得に
+関する5項の重み付き和として書けます——
 
 ```
-acc          ← acc を 5 だけシフト (Q?? → Q??)
-t_exp        ← exp_acc(acc)              (Q40 正規化)
-acc          ← norm_acc_with_t(acc, t_exp)
-lookup_index ← acc の上位ビット - 16384·1.0
-interp_frac  ← acc の下位ビット
-result       ← table[lookup_index]
-             - interp_frac · (table[lookup_index] - table[lookup_index+1])
+p², p, v², v, p·v
 ```
 
-`PREDICT_NORMALIZE_TABLE` と `PREDICT_SECONDARY_TABLE` (各 33 セル) は
-対数的な曲線をテーブル化したもの: 一次テーブルはおおむね 16 ビット数の
-$\log_2$ を Q15 にスケールしたもので、二次テーブルは二次正規化のために結果を
-整形するコンパニオンです。両者とも [src/tables/gain.rs](../../src/tables/gain.rs)
-にあります。
+——ここで `p` が符号利得、`v` がピッチ利得です。したがって探索は何も合成する
+必要がなく、この2次形式を128エントリすべてについて評価し、最小のものを残すだけ
+です。
 
-`gain_orchestrate_codec` は対称的な `gain_orchestrate` に対して 1 つ *微妙な*
-追加最適化を行います: 正規化関数を呼んでからその結果を伝播させるのではなく、
-入力から参照インデックスを **予測** し、`PREDICT_NORMALIZE_TABLE[idx]` および
-`PREDICT_NORMALIZE_TABLE[idx+1]` を正規化の *外側* で先取り取得します。
-そして関数は事前計算されたこの 2 つのテーブルセルを渡された状態で呼び出され、
-二次正規化に対しても予測リフレッシュのフェーズ 2–9 をもう一度再生して二次入力を
-覗き見ることで同様のことを行います。このパターンは Rust コードでも、
-リバースされた挙動とビット一致を保つために維持されています。
+5つの測度は、電力と相関が混在するため異なるスケールで届きます。まず共通の指数に
+揃えます。最大のものより16ビット以上小さい測度は仮数を下げて残りの差をシフト量に
+持たせ、32ビット以上小さいものは完全に捨てます。
 
-## 4. 履歴セットアップと更新
+## 消失フレーム
 
-`gain_history_setup` はテールデケイ前に $g_c$ の候補となる **初期ゲイン** を
-生成します。
-
-```
-restored_acc = saved_ah ∥ predict_acc_main_low_bits  (40 ビット復元)
-shift_count  = history_shift_init - 7                (no-CMPT バックオフ)
-acc          = sample · acc32_16(restored_acc) · 2
-acc          = shift_acc40(acc, shift_count)
-acc          = shift_acc40(acc, -1)
-acc          = sat32(acc)
-initial_gain = hi16(acc)
-```
-
-`gain_history_update` はその後 5 セルの過去ゲイン履歴を更新します。
-これは別の `gain_normalize_primary` をもう 1 度実行し (今回は
-`PREDICT_NORMALIZE_TABLE` 上の第 3 のルックアップ予測を使用)、結果を更新後
-Q15 アキュムレータにシフトし、飽和済みアキュムレータの上位半分と下位半分の
-定数倍率混合 (`0x6054 = 24660` を倍率に) として新履歴エントリを計算します。
-
-```
-new_gain = ((scratch_lo·24660·2) >> 16 + scratch_hi·24660·2) >> 16
-history_out = [new_gain, history[0], history[1], history[2]]
-```
-
-リフレッシュ後、`history_out[0..4]` は `[new_gain, prev[0], prev[1], prev[2]]`
-で、`history_out[4] = history[4]` は定数スロットとして保持されます — これは
-フレーム起動時の定数を運びます (`DecoderState::new` で 0 に初期化)。
-
-## 5. テールデケイ
-
-`gain_tail_decay` は、抑制状態のしきい値が発火した後にゲインを抑える
-ソフトリミッタです。サブフレームごとに以下を実行します。
-
-```
-threshold_in -= 8                  (TAIL_THRESHOLD_STEP)
-if threshold_in >= 0:
-    counter ← TAIL_COUNTER_RELOAD = 4
-threshold_out = 0
-
-if counter ≤ 0:
-    return (デケイなし)              ← (g_p, g_c) を未スケールでパススルー
-
-counter -= 1
-t_value = -counter + 3             (TAIL_EXP_BIAS)
-scale   = MIN_SYNTH_STATE · 2^t_value     (= 3277 << t_value)
-update_base ·= scale          ← スケール後の g_p
-initial_gain ·= scale          ← スケール後の g_c
-return (デケイ適用済, counter_out)
-```
-
-効果としては、しきい値が発火するとゲインが `t_value` (= 末尾に行くほどデケイが強い)
-に応じた 2 のべき乗で乗算的に減衰され、最大 `TAIL_COUNTER_RELOAD` = 4
-サブフレームの間カウントダウンされます。定数 `MIN_SYNTH_STATE = 3277` は
-コーデックの複数箇所で使われる最小状態下限です ([synthesis.md](synthesis.md) 参照)。
-
-定常状態 (suppress なし) では、`threshold_in` は全サブフレームで 0 となり
-`counter_out` も 0 のままなので、テールデケイブロックは素通りで
-`(g_p, g_c) = (update_base, initial_gain)` となります。
-
-> **命名についての注意。** 上で言及した「テールデケイ」は
-> `gain_orchestrate_codec` の内部処理で、ビットストリームの `suppress`
-> フラグに関係なくすべてのサブフレームで実行されます。一方、
-> `suppress=1` のときに使われる代替ゲイン経路 (§6 参照) は完全に別物で、
-> `gain_orchestrate_codec` をまったく呼ばず、独自の減衰ルーチンを使います。
-
-## 6. suppress=1 の代替ゲイン経路
-
-ビットストリームの `suppress` フラグ (bit 138 — 詳細は
-[architecture.md](architecture.md#32-suppress-フラグと-flag-source-ビット)
-を参照) が立っているとき、サブフレームごとのゲインパイプラインは
-`gain_orchestrate_codec` を **呼びません**。代わりに `gain_suppress_decay`
-を呼び、前サブフレームのゲインを固定係数で減衰させます。
-
-```rust
-struct GainSuppressDecay {
-    threshold_out: i16,
-    pitch_gain_out: i16,
-    fcb_gain_out:  i16,
-}
-
-fn gain_suppress_decay(
-    threshold:     i16,
-    pitch_gain_in: i16,   // = self.dec.prev_pitch_gain
-    fcb_gain_in:   i16,   // = フレームローカル fcb_gain_state (prev_fcb_gain で初期化)
-) -> GainSuppressDecay
-```
-
-減衰の係数は *古い* `threshold` の値によって決まります。
-
-| `threshold` | 倍率 (Q15)              | 飽和上限 |
-| ----------- | ----------------------- | -------- |
-| `< 4`       | `31470 / 32768 ≈ 0.960` | 32113    |
-| `≥ 4`       | `26542 / 32768 ≈ 0.810` | 29491    |
-
-`threshold_out = threshold + 1` — `threshold` は suppress=1 のサブフレーム
-ごとに 1 ずつ増え、4 サブフレーム経過すると「強い」減衰モードに切り替わります。
-この加算はラップ算術なので、suppress=1 が長く続けばいずれラップして弱減衰モード
-に戻ります。実用上 suppress=1 は短期間しか続かないため (コンシールメント /
-グリッチマスキング)、ラップは発生しません。
-
-サブフレームループでは次のように接続されます。
-
-```
-let (pitch_gain, fcb_gain) = if ctrl.suppress {
-    let d = gain_suppress_decay(threshold, prev_pitch_gain, fcb_gain_state);
-    threshold = d.threshold_out;
-    (d.pitch_gain_out, d.fcb_gain_out)
-} else {
-    // §1–5 の gain_orchestrate_codec
-    …
-};
-```
-
-入力 `prev_pitch_gain` と `prev_fcb_gain` はフレーム間で `DecoderState`
-に永続化されます ([state.md](state.md#1-decoderstate-構造体) 参照)。
-`counter` および 5 セルの `gain_history` リングは suppress=1 経路では
-意図的に **更新されません** — asm リファレンスではこれらを別ルーチン
-(本最小実装ではまだモデル化していない) で更新します。
-
-ゲイン減衰後、励振ミキシングも suppress=1 では変化します。
-
-```
-e[n] = mix_excitation(v, c, /* pitch_gain */ 0, fcb_gain)
-```
-
-— ピッチ成分は 0 に置き換えられ、FCB 出力のみがスケーリングされます。これは
-asm で `phase_ctl == 0` の分岐がピッチ入力をクリアしてから `mix_excitation`
-を呼び出す経路に対応します。
-
-## 7. 配線
-
-サブフレームごとに出力される 4 つのゲイン結果 (通常経路) は、
-[src/lib.rs](../../src/lib.rs) で次のように接続されます。
-
-```
-pitch_gain   = tail.update_base_out   → mix_excitation
-fcb_gain     = tail.initial_gain_out  → mix_excitation
-threshold    = tail.threshold_out     → 次サブフレームへ
-counter      = tail.counter_out       → 次サブフレームへ
-history_out[5] → 次サブフレームへ (フレーム末でフレーム永続)
-prev_pitch_gain = pitch_gain          → 次サブフレームの compute_pitch_enhance_gain
-prev_fcb_gain   = fcb_gain            → 次フレームの suppress=1 デケイ (state.prev_fcb_gain)
-```
-
-suppress=1 経路では配線は次のように単純化されます。
-
-```
-pitch_gain   = decay.pitch_gain_out   → mix_excitation (ただし 0 倍される)
-fcb_gain     = decay.fcb_gain_out     → mix_excitation
-threshold    = decay.threshold_out    → 次サブフレームへ (= threshold + 1)
-counter, history                      → 変更なし
-prev_pitch_gain = pitch_gain          → 次サブフレームの compute_pitch_enhance_gain
-prev_fcb_gain   = fcb_gain            → 次サブフレームの gain_suppress_decay 入力
-```
-
-**コミット順序** に注目してください: `prev_pitch_gain` はゲインオーケストレーション
-*の後*、しかし次サブフレームの `compute_pitch_enhance_gain` *の前* に更新されます。
-これは必須で、ピッチ強調ゲインが synth-control ヒステリシスを通じて前ピッチゲインに
-依存するためです ([synthesis.md](synthesis.md#1-synth-control-ピッチ強調のゲーティング) を参照)。
-
-## 8. 初期状態
-
-コーデック初期化時、`gain_history` は `[-17254, -17254, -17254, -17254, 0]` に
-セットされ、`gain_threshold = gain_counter = 0` となります。非ゼロの履歴は AR
-予測子に小さな負のバイアスを与え、静的なピッチゲイン包絡を近似します — これが
-ないと、最初の数フレームは履歴が実値で埋まるまで予測が大きく外れます。
-
-suppress=1 のデケイ入力 `prev_pitch_gain` と `prev_fcb_gain` はいずれも `0` で
-初期化されます — したがって、通常フレームを 1 つも処理せずにいきなり suppress=1
-のフレームが到着した場合は、ゼロを減衰させて無音を出力することになります
-(これが望ましいフォールバック挙動です)。
+フレームが失われるとデコーダは利得索引を読めません。代わりに、両利得は連続する
+消失フレームにわたって0へ減衰し、電力予測器の記憶はリセット値の床へ引き下げ
+られます。消失が長く続くほど減衰は深くなるので、バースト消失は最後の正常利得で
+固まるのでも突然切れるのでもなく、フェードアウトします。

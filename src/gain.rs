@@ -1,857 +1,328 @@
-//! Gain-quantization pipeline.
+//! The gain codebook: the encoder's search over it and the decoder's read of
+//! the index that comes back.
+//!
+//! Both subframe gains come from a single 7-bit index into a conjugate
+//! two-stage codebook: the 3 high bits pick a row of the first stage, the 4 low
+//! bits a row of the second, and the two rows are summed.  The first component
+//! of the sum is the pitch gain; the second is a *correction factor* applied to
+//! a predicted code gain, which is itself derived from the innovation's energy
+//! and a 4-tap moving average of past gain energies.
+//!
+//! [`search`] is the encoder's side of the same table: the five
+//! measures the closed loop leaves behind are brought onto one exponent by
+//! [`align`] and every entry is scored against them.
 
-use crate::arith::{acc32_16, exp_acc, norm_acc_with_t, sat32, shift_acc40, to_i40};
-use crate::tables::gain::{
-    COEFF_TABLE, PHASE_TABLE, PREDICT_NORMALIZE_TABLE, PREDICT_SECONDARY_TABLE,
-};
+use crate::fixed::{acc, exp, hi, low, mul, mul32x16, sat, shift, trunc32};
+use crate::pitch::SUBFRAME;
+use crate::tables::{GAIN_CB1, GAIN_CB2, LOG2, POW2};
 
-/// Output of the branch with suppress=1.
-#[derive(Clone, Copy, Debug)]
-pub struct GainSuppressDecay {
-    pub threshold_out: i16,
-    pub pitch_gain_out: i16,
-    pub fcb_gain_out: i16,
+/// Taps of the code-gain energy predictor.
+const ENERGY_TAPS: usize = 4;
+/// 20*log10(2) in Q12 — converts a log2 value to dB.
+const DB_PER_OCTAVE: i16 = 24660;
+/// The reciprocal of [`DB_PER_OCTAVE`] in Q15.
+const OCTAVES_PER_DB: i16 = 5439;
+/// Energy floor written into the predictor memory after a reset.
+pub const ENERGY_RESET: i16 = -17254;
+
+/// Gains in force for the current subframe.
+#[derive(Clone, Copy, Debug, Default)]
+pub struct Gains {
+    /// Adaptive-codebook (pitch) gain, Q14.
+    pub pitch: i16,
+    /// Fixed-codebook gain.
+    pub code: i16,
 }
 
-///  suppress=1 branch — Attenuation of gain values.
+/// Persistent gain-decoder state.
+#[derive(Clone)]
+pub struct GainState {
+    /// Log energies of the last four innovations, newest first.
+    pub energy: [i16; ENERGY_TAPS],
+    /// Gains decoded for the previous subframe.
+    pub gains: Gains,
+    /// Consecutive suppressed frames, used to ramp the gains down.
+    pub erasures: i16,
+    /// Steps left in the ramp that restores the gains after a long erasure.
+    pub recovery: i16,
+    /// Pitch gain of the previous subframe, clamped, used for pitch sharpening.
+    pub sharpen_gain: i16,
+    /// One-subframe-delayed copy of [`Self::sharpen_gain`].
+    pub sharpen_gain_prev: i16,
+}
+
+impl Default for GainState {
+    fn default() -> Self {
+        GainState {
+            energy: [ENERGY_RESET; ENERGY_TAPS],
+            gains: Gains::default(),
+            erasures: 0,
+            recovery: 0,
+            sharpen_gain: 3277,
+            sharpen_gain_prev: 3277,
+        }
+    }
+}
+
+/// Base-2 logarithm of a positive accumulator.
 ///
-/// - `threshold < 4`: gain *= 31470/32768 ≈ 0.960, upper limit 32113
-/// - `threshold >= 4`: gain *= 26542/32768 ≈ 0.810, upper limit 29491
-/// - `threshold_out = threshold + 1` (= increased by one in the BCD delay slot in asm)
-pub fn gain_suppress_decay(
-    threshold: i16,
-    pitch_gain_in: i16,
-    fcb_gain_in: i16,
-) -> GainSuppressDecay {
-    // If the old threshold is 4 or higher, take the strong decay path.
-    let use_strong = threshold >= 4;
-    let coeff: i16 = if use_strong { 26542 } else { 31470 };
-    let cap: i16 = if use_strong { 29491 } else { 32113 };
-
-    // gain *= coeff (Q15 × Q15 → Q30 → take hi16 = Q15).
-    let decay = |gain: i16| -> i16 {
-        let prod: i32 = (gain as i32) * (coeff as i32);
-        let q15: i32 = prod >> 15;
-        q15.min(cap as i32) as i16
-    };
-
-    GainSuppressDecay {
-        threshold_out: threshold.wrapping_add(1),
-        pitch_gain_out: decay(pitch_gain_in),
-        fcb_gain_out: decay(fcb_gain_in),
+/// Returns the fractional part as an accumulator and the negated exponent, so
+/// that `log2(x) = -exponent + fraction`.
+pub fn log2(value: i64) -> (i64, i16) {
+    if value <= 0 {
+        return (0, 0);
     }
+    let scaled = shift(value, 5);
+    let e = exp(scaled);
+    let normalised = shift(scaled, e);
+    let mut a = shift(acc(normalised - (16384i64 << 16)), 5);
+    let index = hi(shift(a, -14)) as usize;
+    a = acc(a - ((index as i64) << 30));
+    let frac = hi(shift(a, -1));
+
+    let b = (LOG2[index] as i64) << 16;
+    let slope = shift(acc(b - ((LOG2[index + 1] as i64) << 16)), 2);
+    let interpolated = acc(b - (hi(slope) as i64) * (frac as i64) * 2);
+    ((hi(interpolated) as i64) << 16, -(e as i16))
 }
 
-#[derive(Clone, Copy, Debug)]
-pub struct GainPhaseSetup {
-    pub acc_main: i64,
-    pub acc_scratch: i64,
-    /// post-incremented address pointing to the next phase-table cell (= upper half)
-    pub phase_first_addr: i16,
-    /// post-incremented address pointing to the next phase-table cell (= lower half)
-    pub phase_second_addr: i16,
-    /// initial value of the gain update base
-    pub update_base: i16,
-    pub saved_ah: i16,
+/// `2^x` for a positive accumulator holding the exponent.
+pub fn pow2(value: i64) -> i64 {
+    let mut a = shift(value, 5);
+    let index = hi(shift(a, -15)) as usize;
+    a = acc(a - ((index as i64) << 31));
+    let frac = hi(shift(a, -2));
+
+    let b = (POW2[index] as i64) << 16;
+    let slope = shift(acc(b - ((POW2[index + 1] as i64) << 16)), 3);
+    let doubled = shift(b, 1);
+    let interpolated = acc(doubled - (hi(slope) as i64) * (frac as i64) * 2);
+    (hi(shift(interpolated, -1)) as i64) << 16
 }
 
-pub fn gain_phase_setup(
-    phase_word: i16,
-    phase_first_upper: i16,
-    phase_first_lower: i16,
-    phase_second_upper: i16,
-    phase_second_lower: i16,
-) -> GainPhaseSetup {
-    let phi = phase_word as i64;
-    let mut acc_scratch = shift_acc40(phi, -4);
-    let mut acc_main: i64 = phi & 0xf;
-    acc_scratch = shift_acc40(acc_scratch, 1);
-    acc_main = shift_acc40(acc_main, 1);
-
-    acc_scratch += -8248i64;
-    let phase_first_addr = (acc_scratch & 0xffff) as u16 as i16;
-    acc_main += -8232i64;
-    let phase_second_addr = (acc_main & 0xffff) as u16 as i16;
-
-    let first_sum: i64 = ((phase_first_upper as i64) + (phase_first_lower as i64)) << 16;
-    let update_base = ((first_sum >> 16) & 0xffff) as i16;
-    let second_sum: i64 = ((phase_second_upper as i64) + (phase_second_lower as i64)) << 16;
-    let saved_ah = ((second_sum >> 16) & 0xffff) as i16;
-
-    GainPhaseSetup {
-        acc_main: second_sum,
-        acc_scratch,
-        phase_first_addr: phase_first_addr.wrapping_add(1),
-        phase_second_addr: phase_second_addr.wrapping_add(1),
-        update_base,
-        saved_ah,
+/// Push the log energy of a decoded gain into the predictor memory.
+fn update_energy(state: &mut GainState, value: i64) {
+    for k in (1..ENERGY_TAPS).rev() {
+        state.energy[k] = state.energy[k - 1];
     }
+    let (frac, neg_exp) = log2(value);
+    let combined = sat(shift(acc(frac + ((neg_exp as i64) << 31)), -3));
+    state.energy[0] = hi(mul32x16(combined, DB_PER_OCTAVE));
 }
 
-#[derive(Clone, Copy, Debug)]
-pub struct GainTailDecayInput {
-    pub threshold_in: i16,
-    pub counter_in: i16,
-    /// gain update base before tail-decay scaling (= phase setup output)
-    pub update_base: i16,
-    /// initial gain before tail-decay scaling (= history setup output)
-    pub initial_gain: i16,
-}
-
-#[derive(Clone, Copy, Debug)]
-pub struct GainTailDecayOutput {
-    pub acc_main: i64,
-    pub acc_scratch: i64,
-    pub threshold_out: i16,
-    pub counter_out: i16,
-    /// gain update base after tail-decay (or pass-through if no decay)
-    pub update_base_out: i16,
-    /// initial gain after tail-decay (or pass-through if no decay)
-    pub initial_gain_out: i16,
-    pub decay_applied: bool,
-}
-
-pub fn gain_tail_decay(input: &GainTailDecayInput) -> GainTailDecayOutput {
-    let mut acc_main: i64 = input.threshold_in as i64;
-    acc_main = to_i40(acc_main - 8); // sub TAIL_THRESHOLD_STEP
-
-    let mut acc_scratch: i64 = input.counter_in as i64;
-    if acc_main >= 0 {
-        acc_scratch = 4; // TAIL_COUNTER_RELOAD
+/// Predict the code gain from the innovation's energy and the gain history.
+///
+/// Returns the predicted gain and the exponent it has to be scaled by.
+pub fn predict_code_gain(state: &GainState, code: &[i16; SUBFRAME]) -> (i16, i16) {
+    let mut energy = 10i64 << 17;
+    for &c in code.iter() {
+        energy = acc(energy + (c as i64) * (c as i64) * 2);
     }
+    let mean = (hi(shift(energy, -2)) as i64) << 16;
 
-    let threshold_out: i16 = 0;
-    let counter_after_load: i16 = (acc_scratch & 0xffff) as u16 as i16;
+    let (frac, neg_exp) = log2(mean);
+    let combined = sat(shift(acc(frac + ((neg_exp as i64) << 31)), -3));
+    let db = shift(mul32x16(combined, DB_PER_OCTAVE), 3);
+    let mut target = acc((18432i64 << 20) - acc(db - (19488i64 << 19)));
 
-    if acc_scratch <= 0 {
-        return GainTailDecayOutput {
-            acc_main,
-            acc_scratch,
-            threshold_out,
-            counter_out: counter_after_load,
-            update_base_out: input.update_base,
-            initial_gain_out: input.initial_gain,
-            decay_applied: false,
-        };
+    let pred = &crate::tables::GAIN_PRED[..ENERGY_TAPS];
+    let mut history = 0i64;
+    for (&p, &e) in pred.iter().zip(state.energy.iter()) {
+        history = acc(history + mul(p, e));
     }
+    target = sat(shift(acc(target + shift(history, 6)), -5));
 
-    acc_scratch -= 1;
-    acc_main = -acc_scratch;
-    acc_main += 3; // TAIL_EXP_BIAS
-    let t_value: i16 = (acc_main & 0xffff) as u16 as i16;
-    let counter_out: i16 = (acc_scratch & 0xffff) as u16 as i16;
-
-    let mut acc_main: i64 = (3277i64) << 16; // MIN_SYNTH_STATE << 16
-    acc_main = shift_acc40(acc_main, t_value);
-
-    let mut acc_scratch: i64 = (input.update_base as i64) * (acc32_16(acc_main) as i64) * 2;
-    let update_base_out = ((acc_scratch >> 16) & 0xffff) as i16;
-    acc_scratch = (input.initial_gain as i64) * (acc32_16(acc_main) as i64) * 2;
-    let initial_gain_out = ((acc_scratch >> 16) & 0xffff) as i16;
-
-    GainTailDecayOutput {
-        acc_main,
-        acc_scratch,
-        threshold_out,
-        counter_out,
-        update_base_out,
-        initial_gain_out,
-        decay_applied: true,
-    }
+    let octaves = shift(mul32x16(target, OCTAVES_PER_DB), 5);
+    let exponent = hi(shift(octaves, -13));
+    let fraction = acc(octaves - ((exponent as i64) << 29));
+    (hi(pow2((hi(shift(fraction, 2)) as i64) << 16)), exponent)
 }
 
-#[derive(Clone, Copy, Debug)]
-pub struct GainHistorySetup {
-    pub acc_main: i64,
-    pub acc_scratch: i64,
-    /// shift count to apply during history history update (= norm backoff result)
-    pub shift_count: i16,
-    pub initial_gain: i16,
-}
+/// Decode both gains for a subframe.
+pub fn decode(state: &mut GainState, index: i16, code: &[i16; SUBFRAME]) -> Gains {
+    let stage1 = &GAIN_CB1[2 * ((index >> 4) as usize)..][..2];
+    let stage2 = &GAIN_CB2[2 * ((index & 15) as usize)..][..2];
 
-pub fn gain_history_setup(
-    predict_acc_main: i64,
-    saved_ah: i16,
-    sample: i16,
-    history_shift: i16,
-) -> GainHistorySetup {
-    // Restore bits 16..32 of predict_acc_main using saved_ah.
-    let restored_bits = (predict_acc_main as u64) & 0x00ff_ffff_ffff_u64;
-    let restored_bits = (restored_bits & !(0xffff_u64 << 16)) | ((saved_ah as u16 as u64) << 16);
-    let restored_acc = to_i40(restored_bits as i64);
+    let pitch = hi(((stage1[0] as i64) + (stage2[0] as i64)) << 16);
+    let correction = hi(((stage1[1] as i64) + (stage2[1] as i64)) << 16);
 
-    // norm backoff (no-CMPT path): shift -= 7
-    let shift_count_after_backoff = history_shift.wrapping_sub(7);
-
-    // build_initial_gain
-    let mut acc_scratch: i64 = (sample as i64) * (acc32_16(restored_acc) as i64) * 2;
-    acc_scratch = shift_acc40(acc_scratch, shift_count_after_backoff);
-    acc_scratch = shift_acc40(acc_scratch, -1);
-    acc_scratch = sat32(acc_scratch);
-
-    let initial_gain = ((acc_scratch >> 16) & 0xffff) as i16;
-
-    GainHistorySetup {
-        acc_main: restored_acc,
-        acc_scratch,
-        shift_count: shift_count_after_backoff,
-        initial_gain,
-    }
-}
-
-pub fn gain_normalize_primary_lookup_index(a_acc_in: i64) -> i16 {
-    if a_acc_in <= 0 {
-        return 0;
-    }
-    let mut acc_main = shift_acc40(a_acc_in, 5);
-    let t_exp = exp_acc(acc_main);
-    acc_main = norm_acc_with_t(acc_main, t_exp);
-    acc_main -= 16384i64 << 16;
-    acc_main = shift_acc40(acc_main, 5);
-    ((shift_acc40(acc_main, -14) >> 16) & 0xffff) as i16
-}
-
-pub fn gain_normalize_secondary_lookup_index(a_acc_in: i64) -> i16 {
-    let acc_main = shift_acc40(a_acc_in, 5);
-    ((shift_acc40(acc_main, -15) >> 16) & 0xffff) as i16
-}
-
-#[derive(Clone, Copy, Debug)]
-pub struct NormalizePrimaryInput {
-    pub acc_main: i64,
-    pub acc_scratch: i64,
-    /// initial value for the negated-exponent register (typically 0 from caller)
-    pub neg_t_exp_in: i16,
-    /// initial value for the lookup-table address pointer (typically 0 from caller)
-    pub next_table_addr_in: i16,
-    pub table0: i16,
-    pub table1: i16,
-}
-
-#[derive(Clone, Copy, Debug)]
-pub struct NormalizePrimaryOutput {
-    pub acc_main: i64,
-    pub acc_scratch: i64,
-    /// negated exponent of the normalized accumulator (= -t_exp)
-    pub neg_t_exp: i16,
-    /// post-incremented address pointing to the next gain_normalize_primary table cell
-    pub next_table_addr: i16,
-    /// integer index used for `table[idx]` / `table[idx + 1]` lookup
-    pub lookup_index: i16,
-    /// fractional weight (Q15) used for linear interpolation between the two table cells
-    pub interp_frac: i16,
-    pub early_return: bool,
-}
-
-/// "Normalize correction" leaf helper used within the gain pipeline.
-pub fn gain_normalize_primary(input: &NormalizePrimaryInput) -> NormalizePrimaryOutput {
-    if input.acc_main <= 0 {
-        return NormalizePrimaryOutput {
-            acc_main: 0,
-            acc_scratch: input.acc_scratch,
-            neg_t_exp: input.neg_t_exp_in,
-            next_table_addr: input.next_table_addr_in,
-            lookup_index: 0,
-            interp_frac: 0,
-            early_return: true,
-        };
-    }
-
-    let mut acc_main = shift_acc40(input.acc_main, 5);
-    let t_exp = exp_acc(acc_main);
-    acc_main = norm_acc_with_t(acc_main, t_exp);
-
-    let mut acc_scratch: i64 = -i64::from(t_exp);
-    let neg_t_exp: i16 = (acc_scratch & 0xffff) as u16 as i16;
-
-    acc_main -= 16384i64 << 16;
-    acc_main = shift_acc40(acc_main, 5);
-    let lookup_index: i16 = ((shift_acc40(acc_main, -14) >> 16) & 0xffff) as i16;
-
-    acc_scratch = (lookup_index as i64) << 16;
-    acc_main -= shift_acc40(acc_scratch, 14);
-    let interp_frac: i16 = ((shift_acc40(acc_main, -1) >> 16) & 0xffff) as i16;
-
-    let mut next_table_addr = (-5592i16).wrapping_add(lookup_index);
-    acc_scratch = (input.table0 as i64) << 16;
-    next_table_addr = next_table_addr.wrapping_add(1);
-
-    let y_ext: i64 = i64::from(input.table1);
-    acc_main = acc_scratch - (y_ext << 16);
-    acc_main = shift_acc40(acc_main, 2);
-
-    acc_scratch -= (interp_frac as i64) * (acc32_16(acc_main) as i64) * 2;
-    let hi_word = ((acc_scratch >> 16) & 0xffff) as i16;
-    let acc_main = (hi_word as i64) << 16;
-
-    NormalizePrimaryOutput {
-        acc_main,
-        acc_scratch,
-        neg_t_exp,
-        next_table_addr,
-        lookup_index,
-        interp_frac,
-        early_return: false,
-    }
-}
-
-#[derive(Clone, Copy, Debug)]
-pub struct NormalizeSecondaryInput {
-    pub acc_main: i64,
-    pub acc_scratch: i64,
-    pub table0: i16,
-    pub table1: i16,
-}
-
-#[derive(Clone, Copy, Debug)]
-pub struct NormalizeSecondaryOutput {
-    pub acc_main: i64,
-    pub acc_scratch: i64,
-    /// post-incremented address pointing to the next gain_normalize_secondary table cell
-    pub next_table_addr: i16,
-    /// integer index used for `table[idx]` / `table[idx + 1]` lookup
-    pub lookup_index: i16,
-    /// fractional weight (Q15) used for linear interpolation between the two table cells
-    pub interp_frac: i16,
-}
-
-/// Alternative normalization for `gain_normalize_primary` (different coefficients).
-/// Called once for the final normalization in predict.
-pub fn gain_normalize_secondary(input: &NormalizeSecondaryInput) -> NormalizeSecondaryOutput {
-    let mut acc_main = shift_acc40(input.acc_main, 5);
-    let lookup_index: i16 = ((shift_acc40(acc_main, -15) >> 16) & 0xffff) as i16;
-
-    let mut acc_scratch: i64 = (lookup_index as i64) << 16;
-    acc_main -= shift_acc40(acc_scratch, 15);
-    let interp_frac: i16 = ((shift_acc40(acc_main, -2) >> 16) & 0xffff) as i16;
-
-    let mut next_table_addr = (-5625i16).wrapping_add(lookup_index);
-    acc_scratch = (input.table0 as i64) << 16;
-    next_table_addr = next_table_addr.wrapping_add(1);
-
-    let y_ext: i64 = i64::from(input.table1);
-    acc_main = acc_scratch - (y_ext << 16);
-    acc_main = shift_acc40(acc_main, 3);
-    acc_scratch = shift_acc40(acc_scratch, 1);
-
-    acc_scratch -= (interp_frac as i64) * (acc32_16(acc_main) as i64) * 2;
-    acc_scratch = shift_acc40(acc_scratch, -1);
-
-    let hi_word = ((acc_scratch >> 16) & 0xffff) as i16;
-    let acc_main = (hi_word as i64) << 16;
-
-    NormalizeSecondaryOutput {
-        acc_main,
-        acc_scratch,
-        next_table_addr,
-        lookup_index,
-        interp_frac,
-    }
-}
-
-#[derive(Clone, Copy, Debug)]
-pub struct GainHistoryInput {
-    pub acc_main: i64,
-    pub acc_scratch: i64,
-    /// shift count forwarded from history_setup (currently unused inside the body)
-    pub shift_count: i16,
-    /// negated exponent forwarded from gain_normalize_primary (typically 0 for fresh entry)
-    pub neg_t_exp_in: i16,
-    pub history: [i16; 3],
-    pub normalize_table0: i16,
-    pub normalize_table1: i16,
-}
-
-#[derive(Clone, Copy, Debug)]
-pub struct GainHistoryOutput {
-    pub acc_main: i64,
-    pub acc_scratch: i64,
-    pub history_out: [i16; 4],
-    pub scratch_29852: [i16; 4],
-}
-
-pub fn gain_history_update(input: &GainHistoryInput) -> GainHistoryOutput {
-    let normalize_in = NormalizePrimaryInput {
-        acc_main: input.acc_main,
-        acc_scratch: input.acc_scratch,
-        neg_t_exp_in: input.neg_t_exp_in,
-        next_table_addr_in: 0,
-        table0: input.normalize_table0,
-        table1: input.normalize_table1,
-    };
-    let normalize_out = gain_normalize_primary(&normalize_in);
-
-    let mut acc_main = normalize_out.acc_main;
-    let acc_scratch: i64 = (normalize_out.neg_t_exp as i64) << 16;
-
-    acc_main += shift_acc40(acc_scratch, 15);
-    acc_main = shift_acc40(acc_main, -3);
-    let saturated_acc = sat32(acc_main);
-
-    let scratch_hi = ((saturated_acc >> 16) & 0xffff) as i16;
-    let scratch_lo = (saturated_acc & 0xffff) as i16;
-    let scratch_29854: i16 = 24660;
-
-    let mut acc_main: i64 = 0;
-    acc_main += (scratch_lo as u16 as i64) * (scratch_29854 as i64) * 2;
-    acc_main = shift_acc40(acc_main, -16);
-    acc_main += (scratch_hi as i64) * (scratch_29854 as i64) * 2;
-
-    let new_gain = ((acc_main >> 16) & 0xffff) as i16;
-
-    let history_out = [
-        new_gain,
-        input.history[0],
-        input.history[1],
-        input.history[2],
-    ];
-
-    GainHistoryOutput {
-        acc_main,
-        acc_scratch,
-        history_out,
-        scratch_29852: [scratch_hi, scratch_lo, scratch_29854, 0],
-    }
-}
-
-#[derive(Clone, Copy, Debug)]
-pub struct GainPredictiveInput {
-    pub acc_main: i64,
-    pub acc_scratch: i64,
-    pub candidate: [i16; 80],
-    pub coeff: [i16; 4],
-    pub history: [i16; 5],
-    pub normalize_table0: i16,
-    pub normalize_table1: i16,
-    pub secondary_table0: i16,
-    pub secondary_table1: i16,
-}
-
-#[derive(Clone, Copy, Debug)]
-pub struct GainPredictiveOutput {
-    pub acc_main: i64,
-    pub acc_scratch: i64,
-    /// shift count to feed into the downstream history setup
-    pub history_shift_init: i16,
-    /// audio sample to feed into the downstream history setup
-    pub history_sample_init: i16,
-}
-
-pub fn gain_predictive_refresh(input: &GainPredictiveInput) -> GainPredictiveOutput {
-    // Phase 1: Energy sum
-    let mut acc_main: i64 = (10i64 << 16) << 1;
-    for &t in input.candidate.iter() {
-        acc_main += (t as i64) * (t as i64) * 2;
-    }
-    let energy_acc_hi = ((shift_acc40(acc_main, -2) >> 16) & 0xffff) as i16;
-    acc_main = (energy_acc_hi as i64) << 16;
-
-    // Phase 2: gain_normalize_primary
-    let normalize_in = NormalizePrimaryInput {
-        acc_main,
-        acc_scratch: input.acc_scratch,
-        neg_t_exp_in: 0,
-        next_table_addr_in: 0,
-        table0: input.normalize_table0,
-        table1: input.normalize_table1,
-    };
-    let normalize_out = gain_normalize_primary(&normalize_in);
-
-    // Phase 3: Linear correction + scratch save
-    let mut acc_main = normalize_out.acc_main;
-    let scratch_post_normalize: i64 = (normalize_out.neg_t_exp as i64) << 16;
-    acc_main += shift_acc40(scratch_post_normalize, 15);
-    acc_main = shift_acc40(acc_main, -3);
-    let saturated_acc = sat32(acc_main);
-    let scratch_29852 = ((saturated_acc >> 16) & 0xffff) as i16;
-    let scratch_29853 = (saturated_acc & 0xffff) as i16;
-    let const_24660: i16 = 24660;
-
-    // Phase 4: 24660 dword × hi/lo multiply
-    let mut acc_main: i64 = 0;
-    acc_main += (scratch_29853 as u16 as i64) * (const_24660 as i64) * 2;
-    acc_main = shift_acc40(acc_main, -16);
-    acc_main += (scratch_29852 as i64) * (const_24660 as i64) * 2;
-
-    // Phase 5: subtract 19488<<19; acc_scratch setup
-    acc_main = shift_acc40(acc_main, 3);
-    let mut acc_scratch: i64 = (19488i64) << 16;
-    acc_main -= shift_acc40(acc_scratch, 3);
-    acc_scratch = (18432i64) << 16;
-    acc_scratch = shift_acc40(acc_scratch, 4);
-    acc_scratch -= acc_main;
-
-    // Phase 6: coeff × history inner product
-    let mut acc_main: i64 = (input.coeff[0] as i64) * (input.history[0] as i64) * 2;
-    for k in 1..4 {
-        acc_main += (input.coeff[k] as i64) * (input.history[k] as i64) * 2;
-    }
-
-    // Phase 7: combine + sat32 + dword save
-    acc_scratch += shift_acc40(acc_main, 6);
-    acc_scratch = shift_acc40(acc_scratch, -5);
-    let saturated_scratch = sat32(acc_scratch);
-    let scratch_29852_b = ((saturated_scratch >> 16) & 0xffff) as i16;
-    let scratch_29853_b = (saturated_scratch & 0xffff) as i16;
-    let const_5439: i16 = 5439;
-
-    // Phase 8: 5439 dword × hi/lo multiply → history_shift_init
-    let mut acc_main: i64 = 0;
-    acc_main += (scratch_29853_b as u16 as i64) * (const_5439 as i64) * 2;
-    acc_main = shift_acc40(acc_main, -16);
-    acc_main += (scratch_29852_b as i64) * (const_5439 as i64) * 2;
-    acc_main = shift_acc40(acc_main, 5);
-    let history_shift_init = ((shift_acc40(acc_main, -13) >> 16) & 0xffff) as i16;
-
-    // Phase 9: gain_normalize_secondary
-    let b_acc_q15: i64 = (history_shift_init as i64) << 16;
-    acc_main -= shift_acc40(b_acc_q15, 13);
-    let secondary_input_hi = ((shift_acc40(acc_main, 2) >> 16) & 0xffff) as i16;
-    let secondary_acc_in = (secondary_input_hi as i64) << 16;
-
-    let secondary_in = NormalizeSecondaryInput {
-        acc_main: secondary_acc_in,
-        acc_scratch: b_acc_q15,
-        table0: input.secondary_table0,
-        table1: input.secondary_table1,
-    };
-    let secondary_out = gain_normalize_secondary(&secondary_in);
-
-    // Phase 10: history_sample_init = hi16 of post-gain_normalize_secondary acc_main
-    let history_sample_init = ((secondary_out.acc_main >> 16) & 0xffff) as i16;
-
-    GainPredictiveOutput {
-        acc_main: secondary_out.acc_main,
-        acc_scratch: secondary_out.acc_scratch,
-        history_shift_init,
-        history_sample_init,
-    }
-}
-
-#[derive(Clone, Copy, Debug)]
-pub struct GainOrchestrateInput {
-    pub phase_word: i16,
-    pub threshold_in: i16,
-    pub counter_in: i16,
-    pub candidate: [i16; 80],
-    pub coeff: [i16; 4],
-    pub history: [i16; 5],
-    pub phase_first_upper: i16,
-    pub phase_first_lower: i16,
-    pub phase_second_upper: i16,
-    pub phase_second_lower: i16,
-    pub predict_normalize_table0: i16,
-    pub predict_normalize_table1: i16,
-    pub predict_secondary_table0: i16,
-    pub predict_secondary_table1: i16,
-    pub history_normalize_table0: i16,
-    pub history_normalize_table1: i16,
-}
-
-#[derive(Clone, Copy, Debug)]
-pub struct GainOrchestrateOutput {
-    pub pitch_gain: i16,
-    pub fcb_gain: i16,
-    pub history_out: [i16; 5],
-    pub threshold_out: i16,
-    pub counter_out: i16,
-}
-
-/// Orchestrator for the suppress=0 path.
-pub fn gain_orchestrate(input: &GainOrchestrateInput) -> GainOrchestrateOutput {
-    let phase = gain_phase_setup(
-        input.phase_word,
-        input.phase_first_upper,
-        input.phase_first_lower,
-        input.phase_second_upper,
-        input.phase_second_lower,
+    let (gcode0, exponent) = predict_code_gain(state, code);
+    let scaled = shift(
+        (correction as i64) * (gcode0 as i64) * 2,
+        (exponent - 7) as i32,
     );
+    let code_gain = hi(sat(shift(scaled, -1)));
 
-    let predict_in = GainPredictiveInput {
-        acc_main: phase.acc_main,
-        acc_scratch: phase.acc_scratch,
-        candidate: input.candidate,
-        coeff: input.coeff,
-        history: input.history,
-        normalize_table0: input.predict_normalize_table0,
-        normalize_table1: input.predict_normalize_table1,
-        secondary_table0: input.predict_secondary_table0,
-        secondary_table1: input.predict_secondary_table1,
+    update_energy(state, (correction as i64) << 16);
+
+    let mut gains = Gains {
+        pitch,
+        code: code_gain,
     };
-    let predict = gain_predictive_refresh(&predict_in);
 
-    let history_setup = gain_history_setup(
-        predict.acc_main,
-        phase.saved_ah,
-        predict.history_sample_init,
-        predict.history_shift_init,
-    );
-
-    let history_in = GainHistoryInput {
-        acc_main: history_setup.acc_main,
-        acc_scratch: history_setup.acc_scratch,
-        shift_count: history_setup.shift_count,
-        neg_t_exp_in: 0,
-        history: [input.history[0], input.history[1], input.history[2]],
-        normalize_table0: input.history_normalize_table0,
-        normalize_table1: input.history_normalize_table1,
+    // Coming out of a long run of erasures the gains are restored over four
+    // subframes rather than all at once.
+    let mut ramp = if state.erasures >= 8 {
+        4
+    } else {
+        state.recovery
     };
-    let history = gain_history_update(&history_in);
+    state.erasures = 0;
+    state.recovery = ramp;
+    if ramp > 0 {
+        ramp -= 1;
+        state.recovery = ramp;
+        let scale = (3277i64) << (3 - ramp);
+        gains.pitch = hi(acc(scale * (gains.pitch as i64) * 2));
+        gains.code = hi(acc(scale * (gains.code as i64) * 2));
+    }
+    state.gains = gains;
+    gains
+}
 
-    let tail_in = GainTailDecayInput {
-        threshold_in: input.threshold_in,
-        counter_in: input.counter_in,
-        update_base: phase.update_base,
-        initial_gain: history_setup.initial_gain,
+/// Gain handling for a suppressed frame: the gains decay and the energy memory
+/// is pulled down towards the reset floor.
+pub fn decode_suppressed(state: &mut GainState) -> Gains {
+    let (factor, ceiling, floor) = if state.erasures - 4 >= 0 {
+        (26542i16, 29491i16, 4096i16)
+    } else {
+        (31470i16, 32113i16, 0i16)
     };
-    let tail = gain_tail_decay(&tail_in);
+    state.erasures += 1;
+    let pitch = hi(mul(state.gains.pitch, factor).min((ceiling as i64) << 15));
+    let code = hi(mul(state.gains.code, factor));
+    state.gains = Gains { pitch, code };
+    decay_energy(state, floor);
+    state.gains
+}
 
-    let history_out = [
-        history.history_out[0],
-        input.history[0],
-        input.history[1],
-        input.history[2],
-        input.history[4],
-    ];
+/// Pull the gain-energy memory towards the reset floor.
+fn decay_energy(state: &mut GainState, offset: i16) {
+    let mut sum = 0i64;
+    for &e in state.energy.iter() {
+        sum = acc(sum + ((e as i64) << 16));
+    }
+    let mut a = shift(shift(sum, -2), 1);
+    a = acc(a - ((offset as i64) << 16));
+    a = a.max((ENERGY_RESET as i64) << 17);
+    for k in (1..ENERGY_TAPS).rev() {
+        state.energy[k] = state.energy[k - 1];
+    }
+    state.energy[0] = hi(shift(a, -1));
+}
 
-    GainOrchestrateOutput {
-        pitch_gain: tail.update_base_out,
-        fcb_gain: tail.initial_gain_out,
-        history_out,
-        threshold_out: tail.threshold_out,
-        counter_out: tail.counter_out,
+/// Terms the five measures are worth relative to one another, before they are
+/// brought to a common exponent.
+///
+/// The first two are energies and the last three correlations, so they carry
+/// different numbers of doublings; the pitch gain's exponent enters twice for
+/// the energy term and once for each of the cross terms.
+fn bias(index: usize, gain_exponent: i64) -> i64 {
+    match index {
+        0 => 12,
+        1 => 13,
+        2 => -2 * gain_exponent,
+        3 => 7 - gain_exponent,
+        _ => 6 - gain_exponent,
     }
 }
 
-#[derive(Clone, Copy, Debug)]
-pub struct GainOrchestrateCodecInput {
-    pub phase_word: i16,
-    pub threshold_in: i16,
-    pub counter_in: i16,
-    pub candidate: [i16; 80],
-    pub history: [i16; 5],
+/// Measures taken to a common exponent, ready for the codebook search.
+pub const MEASURES: usize = 5;
+
+/// Bring the five measures onto one exponent.
+///
+/// Each is held as a mantissa and an exponent; the search that follows adds
+/// them together, so they first have to be lined up.  A measure more than
+/// sixteen bits below the largest has its mantissa shifted down and the rest of
+/// the gap left in the shift, and one more than thirty-two bits below is
+/// dropped altogether.
+pub fn align(
+    mantissa: &mut [i16; MEASURES],
+    exponent: &[i16; MEASURES],
+    gain_exponent: i16,
+) -> [i16; MEASURES] {
+    let mut adjusted = [0i64; MEASURES];
+    for i in 0..MEASURES {
+        adjusted[i] = acc((exponent[i] as i64) + bias(i, gain_exponent as i64));
+    }
+    let smallest = adjusted.iter().copied().fold(i64::MAX, i64::min);
+
+    let mut shift_out = [0i16; MEASURES];
+    for i in 0..MEASURES {
+        let gap = acc((low(adjusted[i]) as i64) - (low(smallest) as i64)).min(32);
+        if gap == 32 {
+            mantissa[i] = 0;
+            shift_out[i] = 0;
+        } else if acc(gap - 16) <= 0 {
+            shift_out[i] = -(gap as i16);
+        } else {
+            mantissa[i] = hi(shift((mantissa[i] as i64) << 16, (16 - gap) as i32));
+            shift_out[i] = -16;
+        }
+    }
+    shift_out
 }
 
-pub fn gain_orchestrate_codec(input: &GainOrchestrateCodecInput) -> GainOrchestrateOutput {
-    // PHASE_TABLE indices: upper4(phase_word)*2, lower4(phase_word)*2 + 16
-    // (phase_word is a 7-bit ctrl field = [0, 127], so idx falls in [0, 14] / [16, 46])
-    let phase_first_idx = ((input.phase_word as usize) >> 4) << 1;
-    let phase_second_idx = (((input.phase_word as usize) & 0xf) << 1) + 16;
+/// The gain codebook, split into a coarse table of eight entries and a fine one
+/// of sixteen.  Each entry is a pair: one term for the adaptive contribution and
+/// one for the fixed one.
+const COARSE_ENTRIES: usize = 8;
+const FINE_ENTRIES: usize = 16;
 
-    let phase_first_upper = PHASE_TABLE[phase_first_idx];
-    let phase_first_lower = PHASE_TABLE[phase_second_idx];
-    let phase_second_upper = PHASE_TABLE[phase_first_idx + 1];
-    let phase_second_lower = PHASE_TABLE[phase_second_idx + 1];
+/// Search the gain codebook.
+///
+/// Every one of the 128 entries is scored against the five aligned measures.
+/// The two gains an entry stands for are `p`, applied to the fixed codebook, and
+/// `v`, the adaptive gain scaled by `scale`; the score is the coding error
+/// written out in the five terms `p^2`, `p`, `v^2`, `v` and `p v`, each weighted
+/// by its measure.  The entry with the smallest error wins.
+pub fn search(
+    scale: i16,
+    mantissa: &[i16; MEASURES],
+    shifts: &[i16; MEASURES],
+    gain_shift: i16,
+) -> (usize, i16, i16) {
+    let coarse = &crate::tables::GAIN_CB1;
+    let fine = &crate::tables::GAIN_CB2;
 
-    let coeff = COEFF_TABLE;
+    let mut best = 0x7fff_ffffi64;
+    let mut chosen = 0usize;
+    for outer in 0..COARSE_ENTRIES {
+        for inner in 0..FINE_ENTRIES {
+            let p = hi(acc(
+                ((coarse[2 * outer] as i64) + (fine[2 * inner] as i64)) << 16
+            ));
+            let q = hi(acc(((coarse[2 * outer + 1] as i64)
+                + (fine[2 * inner + 1] as i64))
+                << 16));
 
-    // predict path: primary normalize lookup index prediction
-    let mut energy_acc: i64 = (10i64 << 16) << 1;
-    for &t in input.candidate.iter() {
-        energy_acc += (t as i64) * (t as i64) * 2;
-    }
-    let energy_acc_hi = ((shift_acc40(energy_acc, -2) >> 16) & 0xffff) as i16;
-    let predict_normalize_acc_in = (energy_acc_hi as i64) << 16;
-    let predict_normalize_idx =
-        gain_normalize_primary_lookup_index(predict_normalize_acc_in) as usize;
-    let predict_normalize_table0 = PREDICT_NORMALIZE_TABLE
-        .get(predict_normalize_idx)
-        .copied()
-        .unwrap_or(0);
-    let predict_normalize_table1 = PREDICT_NORMALIZE_TABLE
-        .get(predict_normalize_idx.wrapping_add(1))
-        .copied()
-        .unwrap_or(0);
+            let v = trunc32(acc(crate::fixed::mul(scale, q)));
+            let square = trunc32(crate::fixed::square32(v));
+            let cross = trunc32(crate::fixed::mul32x16(v, p));
+            let energy = acc(crate::fixed::mul(p, p));
 
-    // Phase setup (full)
-    let phase = gain_phase_setup(
-        input.phase_word,
-        phase_first_upper,
-        phase_first_lower,
-        phase_second_upper,
-        phase_second_lower,
-    );
+            let term = |value: i64, i: usize| shift(value, shifts[i] as i32);
+            let mut cost = term(crate::fixed::mul32x16(energy, mantissa[0]), 0);
+            cost = acc(cost + term(acc(crate::fixed::mul(p, mantissa[1])), 1));
+            cost = acc(cost + term(crate::fixed::mul32x16(square, mantissa[2]), 2));
+            cost = acc(cost + term(crate::fixed::mul32x16(v, mantissa[3]), 3));
+            cost = acc(cost + term(crate::fixed::mul32x16(cross, mantissa[4]), 4));
 
-    // Replay phases 2-9 of predict to get secondary normalize input acc_main (need partial predict)
-    // Replicate predict phases 2-9 here:
-    let normalize_in = NormalizePrimaryInput {
-        acc_main: predict_normalize_acc_in,
-        acc_scratch: phase.acc_scratch,
-        neg_t_exp_in: 0,
-        next_table_addr_in: 0,
-        table0: predict_normalize_table0,
-        table1: predict_normalize_table1,
-    };
-    let normalize_out = gain_normalize_primary(&normalize_in);
-
-    let mut acc_main = normalize_out.acc_main;
-    let scratch_post_normalize: i64 = (normalize_out.neg_t_exp as i64) << 16;
-    acc_main += shift_acc40(scratch_post_normalize, 15);
-    acc_main = shift_acc40(acc_main, -3);
-    let saturated_acc = sat32(acc_main);
-    let scratch_29852 = ((saturated_acc >> 16) & 0xffff) as i16;
-    let scratch_29853 = (saturated_acc & 0xffff) as i16;
-
-    let mut acc_main: i64 = 0;
-    acc_main += (scratch_29853 as u16 as i64) * (24660i64) * 2;
-    acc_main = shift_acc40(acc_main, -16);
-    acc_main += (scratch_29852 as i64) * (24660i64) * 2;
-    acc_main = shift_acc40(acc_main, 3);
-    let mut acc_scratch: i64 = (19488i64) << 16;
-    acc_main -= shift_acc40(acc_scratch, 3);
-    acc_scratch = (18432i64) << 16;
-    acc_scratch = shift_acc40(acc_scratch, 4);
-    acc_scratch -= acc_main;
-
-    let mut acc_main: i64 = (coeff[0] as i64) * (input.history[0] as i64) * 2;
-    for k in 1..4 {
-        acc_main += (coeff[k] as i64) * (input.history[k] as i64) * 2;
+            if cost < best {
+                chosen = FINE_ENTRIES * outer + inner;
+            }
+            best = trunc32(best.min(cost));
+        }
     }
 
-    acc_scratch += shift_acc40(acc_main, 6);
-    acc_scratch = shift_acc40(acc_scratch, -5);
-    let saturated_scratch = sat32(acc_scratch);
-    let scratch_29852_b = ((saturated_scratch >> 16) & 0xffff) as i16;
-    let scratch_29853_b = (saturated_scratch & 0xffff) as i16;
-
-    let mut acc_main: i64 = 0;
-    acc_main += (scratch_29853_b as u16 as i64) * (5439i64) * 2;
-    acc_main = shift_acc40(acc_main, -16);
-    acc_main += (scratch_29852_b as i64) * (5439i64) * 2;
-    acc_main = shift_acc40(acc_main, 5);
-    let history_shift_init = ((shift_acc40(acc_main, -13) >> 16) & 0xffff) as i16;
-
-    let b_acc_q15: i64 = (history_shift_init as i64) << 16;
-    acc_main -= shift_acc40(b_acc_q15, 13);
-    let secondary_input_hi = ((shift_acc40(acc_main, 2) >> 16) & 0xffff) as i16;
-    let secondary_acc_in = (secondary_input_hi as i64) << 16;
-
-    // secondary normalize lookup index prediction
-    let predict_secondary_idx = gain_normalize_secondary_lookup_index(secondary_acc_in) as usize;
-    let predict_secondary_table0 = PREDICT_SECONDARY_TABLE
-        .get(predict_secondary_idx)
-        .copied()
-        .unwrap_or(0);
-    let predict_secondary_table1 = PREDICT_SECONDARY_TABLE
-        .get(predict_secondary_idx.wrapping_add(1))
-        .copied()
-        .unwrap_or(0);
-
-    // Now run predict with predicted tables
-    let predict_in = GainPredictiveInput {
-        acc_main: phase.acc_main,
-        acc_scratch: phase.acc_scratch,
-        candidate: input.candidate,
-        coeff,
-        history: input.history,
-        normalize_table0: predict_normalize_table0,
-        normalize_table1: predict_normalize_table1,
-        secondary_table0: predict_secondary_table0,
-        secondary_table1: predict_secondary_table1,
-    };
-    let predict = gain_predictive_refresh(&predict_in);
-
-    let history_setup = gain_history_setup(
-        predict.acc_main,
-        phase.saved_ah,
-        predict.history_sample_init,
-        predict.history_shift_init,
-    );
-
-    // history path: primary normalize lookup index prediction
-    let history_normalize_idx =
-        gain_normalize_primary_lookup_index(history_setup.acc_main) as usize;
-    let history_normalize_table0 = PREDICT_NORMALIZE_TABLE
-        .get(history_normalize_idx)
-        .copied()
-        .unwrap_or(0);
-    let history_normalize_table1 = PREDICT_NORMALIZE_TABLE
-        .get(history_normalize_idx.wrapping_add(1))
-        .copied()
-        .unwrap_or(0);
-
-    let history_in = GainHistoryInput {
-        acc_main: history_setup.acc_main,
-        acc_scratch: history_setup.acc_scratch,
-        shift_count: history_setup.shift_count,
-        neg_t_exp_in: 0,
-        history: [input.history[0], input.history[1], input.history[2]],
-        normalize_table0: history_normalize_table0,
-        normalize_table1: history_normalize_table1,
-    };
-    let history = gain_history_update(&history_in);
-
-    let tail_in = GainTailDecayInput {
-        threshold_in: input.threshold_in,
-        counter_in: input.counter_in,
-        update_base: phase.update_base,
-        initial_gain: history_setup.initial_gain,
-    };
-    let tail = gain_tail_decay(&tail_in);
-
-    let history_out = [
-        history.history_out[0],
-        input.history[0],
-        input.history[1],
-        input.history[2],
-        input.history[4],
-    ];
-
-    GainOrchestrateOutput {
-        pitch_gain: tail.update_base_out,
-        fcb_gain: tail.initial_gain_out,
-        history_out,
-        threshold_out: tail.threshold_out,
-        counter_out: tail.counter_out,
-    }
-}
-
-#[cfg(test)]
-mod tests {
-    use super::*;
-
-    #[test]
-    fn gain_phase_setup_zero_input() {
-        let s = gain_phase_setup(0, 0, 0, 0, 0);
-        assert_eq!(s.acc_main, 0);
-        assert_eq!(s.update_base, 0);
-        assert_eq!(s.saved_ah, 0);
-    }
-
-    #[test]
-    fn gain_tail_decay_no_decay_path() {
-        let r = gain_tail_decay(&GainTailDecayInput {
-            threshold_in: 0,
-            counter_in: 0,
-            update_base: 1234,
-            initial_gain: 5678,
-        });
-        assert!(!r.decay_applied);
-        assert_eq!(r.threshold_out, 0);
-        assert_eq!(r.update_base_out, 1234);
-        assert_eq!(r.initial_gain_out, 5678);
-    }
-
-    #[test]
-    fn gain_tail_decay_reload_at_threshold_8() {
-        let r = gain_tail_decay(&GainTailDecayInput {
-            threshold_in: 8,
-            counter_in: 0,
-            update_base: 16384,
-            initial_gain: 16384,
-        });
-        // counter reload to 4 → acc_scratch = 4 > 0 → decay path
-        // counter -= 1 → counter_out = 3
-        assert!(r.decay_applied);
-        assert_eq!(r.counter_out, 3);
-        assert_eq!(r.threshold_out, 0);
-    }
-
-    #[test]
-    fn gain_history_setup_basic() {
-        let s = gain_history_setup(0, 0, 0, 7);
-        // shift_count = 7 - 7 = 0
-        assert_eq!(s.shift_count, 0);
-        assert_eq!(s.initial_gain, 0);
-    }
+    let (outer, inner) = (chosen / FINE_ENTRIES, chosen % FINE_ENTRIES);
+    let p = hi(acc(
+        ((coarse[2 * outer] as i64) + (fine[2 * inner] as i64)) << 16
+    ));
+    let q = hi(acc(((coarse[2 * outer + 1] as i64)
+        + (fine[2 * inner + 1] as i64))
+        << 16));
+    let scaled = shift(acc(crate::fixed::mul(scale, q)), (gain_shift - 7) as i32);
+    (chosen, p, hi(shift(scaled, -1)))
 }

@@ -1,10 +1,19 @@
 [package]
-name = "mcelp_codec"
+name = "mcelp"
 version = "0.1.0"
 edition = "2024"
-description = "Mitsubishi CELP speech codec"
+rust-version = "1.85"
+description = "Mitsubishi CELP speech codec: a 3.6 kbit/s speech encoder and decoder"
+license = "MIT"
+readme = "README.md"
+repository = "https://github.com/soltia48/mcelp-codec"
+keywords = ["codec", "speech", "celp", "audio", "dsp"]
+categories = ["multimedia::audio", "encoding"]
+# The regression suite replays several megabytes of dumps from the reference
+# implementation.  It is the proof the codec is bit exact, but it belongs to the
+# repository rather than to every download of the library.
+exclude = ["tests/"]
 
 [lib]
+name = "mcelp"
 path = "src/lib.rs"
-
-[dependencies]

@@ -1,54 +1,25 @@
-//! Simple .mcelp decoder CLI.
-//! Reads 36-char hex frames (one per line) from stdin and writes raw μ-law PCM to stdout.
+//! Decode an M-CELP bit stream on stdin to raw mu-law on stdout.
+//!
+//! Input is one hex-encoded 18-byte frame per line; output is 320 mu-law bytes
+//! per frame.  This mirrors the reference `mcelp_codec` in its decode mode.
 
-use mcelp_codec::{Codec, MCELP_FRAME_BYTES, bitstream::parse_frame_hex};
-use std::io::{self, BufRead, Write};
-use std::process::ExitCode;
+use std::io::{BufRead, Write};
 
-fn main() -> ExitCode {
-    let stdin = io::stdin();
-    let stdout = io::stdout();
-    let mut out = stdout.lock();
+use mcelp::{Decoder, bitstream};
 
-    let mut codec = Codec::new();
-    let mut frame_count = 0usize;
-    let mut reset_count = 0usize;
+fn main() -> std::io::Result<()> {
+    let stdin = std::io::stdin();
+    let stdout = std::io::stdout();
+    let mut out = std::io::BufWriter::new(stdout.lock());
+    let mut decoder = Decoder::new();
 
-    for (line_no, line) in stdin.lock().lines().enumerate() {
-        let line = match line {
-            Ok(s) => s,
-            Err(e) => {
-                eprintln!("read stdin: {e}");
-                return ExitCode::FAILURE;
-            }
-        };
-        let trimmed = line.trim();
-        if trimmed.is_empty() {
+    for line in stdin.lock().lines() {
+        let Some(frame) = bitstream::parse_hex_line(&line?) else {
             continue;
-        }
-        let frame: [u8; MCELP_FRAME_BYTES] = match parse_frame_hex(trimmed) {
-            Some(f) => f,
-            None => {
-                eprintln!("line {}: invalid hex frame: {}", line_no + 1, trimmed);
-                return ExitCode::FAILURE;
-            }
         };
-        frame_count += 1;
-        match codec.decode_frame(&frame) {
-            Some(pcm) => {
-                if let Err(e) = out.write_all(&pcm) {
-                    eprintln!("write stdout: {e}");
-                    return ExitCode::FAILURE;
-                }
-            }
-            None => reset_count += 1,
+        if let Some(pcm) = decoder.decode(&frame) {
+            out.write_all(&pcm)?;
         }
     }
-
-    if let Err(e) = out.flush() {
-        eprintln!("flush stdout: {e}");
-        return ExitCode::FAILURE;
-    }
-    eprintln!("decoded {frame_count} frames ({reset_count} reset)");
-    ExitCode::SUCCESS
+    out.flush()
 }

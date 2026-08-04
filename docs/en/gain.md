@@ -1,317 +1,86 @@
-# Gain Quantization
+# Gains
 
-The pitch gain $g_p$ and the FCB gain $g_c$ for each subframe are jointly
-encoded into a **7-bit phase word** carried by F[4], F[7], F[10], F[13]
-of the bitstream. Recovering them on the decode side is non-trivial: it
-involves a phase-table lookup, a predictive refresh that walks several
-fixed tables, an exponential history update of the prediction state, and a
-threshold-driven tail-decay limiter.
-
-This document walks through that pipeline. Source:
-[src/gain.rs](../../src/gain.rs), [src/tables/gain.rs](../../src/tables/gain.rs).
-The orchestrator entry point is `gain_orchestrate_codec`.
-
-## 1. Inputs and outputs
-
-### Inputs
-
-```rust
-struct GainOrchestrateCodecInput {
-    phase_word:    i16,    // 7-bit field from the bitstream
-    threshold_in:  i16,    // tail-decay threshold (frame-persistent)
-    counter_in:    i16,    // tail-decay counter   (frame-persistent)
-    candidate:     [i16; 80], // the FCB output c[n] for this subframe
-    history:       [i16; 5],  // past-gain history (frame-persistent)
-}
-```
-
-### Outputs
-
-```rust
-struct GainOrchestrateOutput {
-    pitch_gain:     i16,   // g_p, fed into mix_excitation as pitch_gain
-    fcb_gain:       i16,   // g_c, fed into mix_excitation as fcb_gain
-    history_out:    [i16; 5],
-    threshold_out:  i16,
-    counter_out:    i16,
-}
-```
-
-The `phase_word` is shared by both gains — that is, the encoder transmits
-a single 7-bit index per subframe that selects one of 128 jointly
-quantized `(g_p, g_c)` pairs. The other inputs come from per-frame state
-that is updated subframe-by-subframe (see [state.md](state.md)).
-
-## 2. Phase setup
-
-`gain_phase_setup(phase_word, …)` decomposes the phase word into two
-4-bit halves and uses each half to look up two cells (an "upper" and
-"lower" pair) of `PHASE_TABLE`:
+Each subframe's excitation is the sum of two scaled contributions:
 
 ```
-phase_first_idx  = (phase_word >> 4) << 1     // 0..14
-phase_second_idx = ((phase_word & 0xF) << 1) + 16   // 16..46
-
-phase_first_upper = PHASE_TABLE[phase_first_idx]
-phase_first_lower = PHASE_TABLE[phase_first_idx + 1]
-phase_second_upper= PHASE_TABLE[phase_second_idx]
-phase_second_lower= PHASE_TABLE[phase_second_idx + 1]
+excitation = gₚ · (adaptive codebook) + g_c · (fixed codebook)
 ```
 
-`PHASE_TABLE` is a 48-cell quantization table from
-[src/tables/gain.rs](../../src/tables/gain.rs). The **upper 3 bits** of
-`phase_word` (i.e. `phase_word >> 4`, range 0..7) select a pair of cells
-in `PHASE_TABLE[0..16]`, and the **lower 4 bits** (range 0..15) select a
-pair of cells in `PHASE_TABLE[16..48]`. Conceptually the two halves carry
-quantized values for $g_c$ and $g_p$ respectively, but they are not used
-as-is — they go through the predictive refresh below.
+Both gains come from a **single 7-bit index**. Sending them jointly rather
+than separately exploits the fact that they are correlated — a strongly voiced
+subframe wants a large pitch gain and a small code gain, and vice versa — so a
+joint codebook covers the useful region far more efficiently than two
+independent ones.
 
-`gain_phase_setup` then computes:
+## The conjugate codebook
 
-- `update_base = ((phase_first_upper + phase_first_lower) << 16) >> 16`
-  — initial $g_p$ candidate.
-- `saved_ah    = ((phase_second_upper + phase_second_lower) << 16) >> 16`
-  — bookkeeping value passed into the history setup.
-
-It also derives two i40 accumulators (`acc_main`, `acc_scratch`) seeded
-with the phase-word bits to feed the predictive refresh.
-
-## 3. Predictive refresh
-
-`gain_predictive_refresh` is the dominant computation. It produces
-`history_shift_init` (an integer shift count) and `history_sample_init`
-(a Q15 sample) which together define the **excitation reference level**
-the gain quantizer will normalise against. The 10 phases of the function
-mirror the original DSP routine; the high-level structure is:
+The 7 bits split into two stages:
 
 ```
-1. Energy of the FCB candidate:
-       E = 10·2^17 + 2·Σ c[n]^2
-   (the 10·2^17 is a small-energy floor)
-2. Primary normalisation against PREDICT_NORMALIZE_TABLE
-       — pick a lookup index from the normalised energy,
-         interpolate between two table cells (Q15 frac).
-3. Linear correction (subtract 19488<<19, add 18432<<20).
-4. 4-tap inner product with the past-gain history:
-       acc_main = Σ_{k=0..3} COEFF_TABLE[k] · history[k]
-   where COEFF_TABLE = [5571, 4096, 2703, 1311] is a 4-pole AR predictor.
-5. Combine + 5439-multiplier mix → history_shift_init.
-6. Secondary normalisation against PREDICT_SECONDARY_TABLE
-       (the same shape as primary, with different coefficients).
-7. history_sample_init = hi16 of the post-secondary accumulator.
+index = [ 3 bits ][ 4 bits ]
+           │         └── second stage: 16 rows × (pitch term, code term)
+           └──────────── first stage:   8 rows × (pitch term, code term)
 ```
 
-The two normalisation steps are implemented by `gain_normalize_primary`
-and `gain_normalize_secondary`. Both are **piecewise-linear** approximations
-of (different) nonlinear functions, with a 33-cell lookup table indexed
-by the normalised mantissa of the i40 accumulator and a Q15 fractional
-weight to interpolate between cells. The structure is:
+The two rows are summed component-wise. 8 × 16 = 128 combinations from a table
+of only 24 rows — that is the "conjugate" structure, and it makes the search
+cheap enough to run exhaustively.
+
+The first component of the sum is the pitch gain, used directly. The second is
+**not** the code gain. It is a correction factor applied to a *predicted* code
+gain.
+
+## Why the code gain is predicted
+
+The fixed-codebook gain has to span the whole dynamic range of speech —
+silence to a shout — which would cost many bits to code directly. But it is
+strongly predictable: the energy the innovation needs this subframe is close
+to what it needed last subframe, once the innovation's own energy is
+accounted for.
+
+So the coder predicts it:
+
+1. take the innovation's energy for this subframe;
+2. take a 4-tap moving average of the *prediction errors* of the last four
+   subframes, kept in dB;
+3. combine them to predict the gain this subframe should need;
+4. send only the correction factor — how far the real answer sits from the
+   prediction.
+
+The correction spans a much smaller range than the gain itself, so 4 bits of
+codebook carry it. The predictor memory is one of the pieces of decoder state
+that makes a stream undecodable from the middle: get the four past errors
+wrong and every subsequent code gain is wrong too.
+
+Everything here is done in the logarithmic domain, which is why the module
+carries `log2` and `2^x` tables. A gain is a multiplicative quantity; averaging
+gains in dB is averaging the thing that is actually stationary.
+
+## The encoder's search
+
+The closed loop leaves behind five measures describing the subframe: two
+energies and three correlations, relating the target, the adaptive
+contribution and the fixed one. Every candidate's coding error can be written
+as a weighted sum of five terms in the two gains —
 
 ```
-acc          ← sft acc by 5 (Q?? → Q??)
-t_exp        ← exp_acc(acc)              (Q40 normalize)
-acc          ← norm_acc_with_t(acc, t_exp)
-lookup_index ← upper bits of acc - 16384·1.0
-interp_frac  ← lower bits of acc
-result       ← table[lookup_index]
-             - interp_frac · (table[lookup_index] - table[lookup_index+1])
+p², p, v², v, p·v
 ```
 
-`PREDICT_NORMALIZE_TABLE` and `PREDICT_SECONDARY_TABLE` (33 cells each)
-are tabulated logarithm-like curves: the primary table is approximately
-$\log_2$ of a 16-bit number scaled to Q15, and the secondary table is a
-companion that reshapes the result for the second normalisation. They
-live in [src/tables/gain.rs](../../src/tables/gain.rs).
+— where `p` is the code gain and `v` the pitch gain. So the search does not
+have to synthesise anything: it evaluates that quadratic for all 128 entries
+and keeps the smallest.
 
-`gain_orchestrate_codec` performs one *subtle* additional optimisation
-over the symmetric `gain_orchestrate`: rather than calling the
-normalisation functions and then propagating their results, it
-**predicts** the lookup index from the input and pre-fetches
-`PREDICT_NORMALIZE_TABLE[idx]` and `PREDICT_NORMALIZE_TABLE[idx+1]`
-*outside* the normalisation. The function is then called with these two
-table cells precomputed, and the same is done for the secondary
-normalisation by replaying phases 2–9 of the predictive refresh once to
-peek at the secondary input. This pattern is preserved in the Rust code
-to remain bit-exact with the reverse-engineered behaviour.
+The five measures arrive at different scales, since some are energies and
+some correlations. They are first brought onto a common exponent: a measure
+more than 16 bits below the largest has its mantissa shifted down and the rest
+of the gap carried in a shift, and one more than 32 bits below is dropped
+entirely.
 
-## 4. History setup and update
+## Erased frames
 
-`gain_history_setup` produces the **initial gain** that will become the
-candidate for $g_c$ before tail decay:
-
-```
-restored_acc = saved_ah ∥ predict_acc_main_low_bits  (40-bit reconstruct)
-shift_count  = history_shift_init - 7                (no-CMPT backoff)
-acc          = sample · acc32_16(restored_acc) · 2
-acc          = shift_acc40(acc, shift_count)
-acc          = shift_acc40(acc, -1)
-acc          = sat32(acc)
-initial_gain = hi16(acc)
-```
-
-`gain_history_update` then refreshes the 5-cell past-gain history. It
-runs another `gain_normalize_primary` (this time using a third lookup
-prediction over `PREDICT_NORMALIZE_TABLE`), shifts the result into the
-post-update Q15 accumulator, and computes a new history entry as a
-constant-multiplier-mix of the high and low halves of the saturated
-accumulator with `0x6054 = 24660` as the multiplier:
-
-```
-new_gain = ((scratch_lo·24660·2) >> 16 + scratch_hi·24660·2) >> 16
-history_out = [new_gain, history[0], history[1], history[2]]
-```
-
-After the refresh, `history_out[0..4]` is `[new_gain, prev[0], prev[1],
-prev[2]]` and `history_out[4] = history[4]` is preserved as a constant
-slot — it carries a frame-startup constant (initialised to 0 in
-`DecoderState::new`).
-
-## 5. Tail decay
-
-`gain_tail_decay` is a soft limiter that cuts the gains once the
-suppress-state threshold has fired. Every subframe it does:
-
-```
-threshold_in -= 8                  (TAIL_THRESHOLD_STEP)
-if threshold_in >= 0:
-    counter ← TAIL_COUNTER_RELOAD = 4
-threshold_out = 0
-
-if counter ≤ 0:
-    return (no decay)              ← unscaled (g_p, g_c) pass through
-
-counter -= 1
-t_value = -counter + 3             (TAIL_EXP_BIAS)
-scale   = MIN_SYNTH_STATE · 2^t_value     (= 3277 << t_value)
-update_base ·= scale          ← scaled g_p
-initial_gain ·= scale          ← scaled g_c
-return (decay applied, counter_out)
-```
-
-The effect is that once the threshold trips, the gains are
-multiplicatively scaled down by a power of 2 that increases with
-`t_value` (= more decay later in the tail), counted down for at most
-`TAIL_COUNTER_RELOAD` = 4 subframes. The constant `MIN_SYNTH_STATE =
-3277` is the minimum-state floor used in several places in the codec
-(see [synthesis.md](synthesis.md)).
-
-In the steady state (no suppress), `threshold_in` is 0 across all
-subframes and `counter_out` stays 0, so the tail-decay block is a pass-
-through and `(g_p, g_c) = (update_base, initial_gain)`.
-
-> **Naming note.** "Tail decay" above is internal to
-> `gain_orchestrate_codec` and runs on every subframe regardless of the
-> bitstream `suppress` flag. The completely separate `suppress=1`
-> alternative gain path (see §6 below) skips `gain_orchestrate_codec`
-> entirely and uses its own decay routine.
-
-## 6. Suppress=1 alternative gain path
-
-When the bitstream's `suppress` flag is set (bit 138 — see
-[architecture.md](architecture.md#32-suppress-flag-and-flag-source-bit)),
-the per-subframe gain pipeline does **not** call
-`gain_orchestrate_codec`. Instead it calls `gain_suppress_decay`, which
-attenuates the previous subframe's gains by a fixed factor:
-
-```rust
-struct GainSuppressDecay {
-    threshold_out: i16,
-    pitch_gain_out: i16,
-    fcb_gain_out:  i16,
-}
-
-fn gain_suppress_decay(
-    threshold:     i16,
-    pitch_gain_in: i16,   // = self.dec.prev_pitch_gain
-    fcb_gain_in:   i16,   // = frame-local fcb_gain_state (init from prev_fcb_gain)
-) -> GainSuppressDecay
-```
-
-The decay constants depend on the *old* threshold value:
-
-| `threshold` | Multiplier (Q15)        | Saturation cap |
-| ----------- | ----------------------- | -------------- |
-| `< 4`       | `31470 / 32768 ≈ 0.960` | 32113          |
-| `≥ 4`       | `26542 / 32768 ≈ 0.810` | 29491          |
-
-`threshold_out = threshold + 1` — the threshold is incremented each
-suppress=1 subframe, so once 4 suppress=1 subframes have elapsed the
-"strong" decay kicks in. The increment uses wrapping arithmetic, so
-sustained suppress=1 frames eventually wrap and re-enter the weak-decay
-regime; in practice suppress=1 is short-lived (concealment / glitch
-masking) so the wrap is not exercised.
-
-In the per-subframe loop this is wired as:
-
-```
-let (pitch_gain, fcb_gain) = if ctrl.suppress {
-    let d = gain_suppress_decay(threshold, prev_pitch_gain, fcb_gain_state);
-    threshold = d.threshold_out;
-    (d.pitch_gain_out, d.fcb_gain_out)
-} else {
-    // gain_orchestrate_codec as in §1–5
-    …
-};
-```
-
-The state inputs `prev_pitch_gain` and `prev_fcb_gain` are persisted
-across frames in `DecoderState` (see
-[state.md](state.md#1-the-decoderstate-struct)). `counter` and the
-`gain_history` 5-cell ring are intentionally **not** touched by the
-suppress=1 path — the asm reference updates them through a separate
-routine that this minimal implementation does not yet model.
-
-After the gain decay, the excitation mix is also altered for suppress=1:
-
-```
-e[n] = mix_excitation(v, c, /* pitch_gain */ 0, fcb_gain)
-```
-
-— the pitch component is zeroed and only the FCB output is scaled. This
-matches the asm path where the `phase_ctl == 0` branch nulls the pitch
-input before calling `mix_excitation`.
-
-## 7. Wiring
-
-The four gain results emitted per subframe (normal path) are wired in
-[src/lib.rs](../../src/lib.rs) as:
-
-```
-pitch_gain   = tail.update_base_out   → mix_excitation
-fcb_gain     = tail.initial_gain_out  → mix_excitation
-threshold    = tail.threshold_out     → next subframe
-counter      = tail.counter_out       → next subframe
-history_out[5] → next subframe (frame-persistent at frame end)
-prev_pitch_gain = pitch_gain          → next subframe's compute_pitch_enhance_gain
-prev_fcb_gain   = fcb_gain            → next frame's suppress=1 decay (state.prev_fcb_gain)
-```
-
-For the suppress=1 path the wiring degenerates to:
-
-```
-pitch_gain   = decay.pitch_gain_out   → mix_excitation (but multiplied by 0)
-fcb_gain     = decay.fcb_gain_out     → mix_excitation
-threshold    = decay.threshold_out    → next subframe (= threshold + 1)
-counter, history                      → unchanged
-prev_pitch_gain = pitch_gain          → next subframe's compute_pitch_enhance_gain
-prev_fcb_gain   = fcb_gain            → next subframe's gain_suppress_decay input
-```
-
-Notice the **commit ordering**: `prev_pitch_gain` is updated *after*
-gain orchestration but *before* the next subframe's
-`compute_pitch_enhance_gain` is called, which is essential because the
-pitch-enhance gain depends on the previous pitch gain via the synth-
-control hysteresis (see [synthesis.md](synthesis.md#synth-control)).
-
-## 8. Initial state
-
-At codec init `gain_history` is set to `[-17254, -17254, -17254, -17254,
-0]` and `gain_threshold = gain_counter = 0`. The non-zero history
-seeds the AR predictor with a small negative bias that approximates the
-quiescent pitch-gain envelope — without it, the first few decoded frames
-would mispredict severely until the history fills with real values.
-
-The suppress=1 decay inputs `prev_pitch_gain` and `prev_fcb_gain` are
-both initialised to `0` — so the very first frame that arrives with
-suppress=1 (without any preceding normal frame) decays zeros and emits
-silence, which is the desired fallback.
+When a frame is lost, the decoder cannot read a gain index. Instead both gains
+decay towards zero over successive lost frames, and the energy predictor's
+memory is pulled down towards its reset floor. The attenuation deepens the
+longer the erasure runs, so a burst fades out rather than either freezing on
+the last good gain or cutting off abruptly.

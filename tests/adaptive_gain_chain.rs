@@ -27,6 +27,6 @@ fn replay(path: &str) -> usize {
 }
 
 #[test]
-fn de00_chain_excerpt() {
-    assert_eq!(replay("tests/data/de00_chain.txt"), 120);
+fn adaptive_gain_chain_excerpt() {
+    assert_eq!(replay("tests/data/adaptive_gain_chain.txt"), 120);
 }

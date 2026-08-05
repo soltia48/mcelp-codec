@@ -1,4 +1,4 @@
-//! Quantisation in place: the second half-frame's line spectrum.
+//! The line spectrum quantiser composed: cosine domain in, transport fields out.
 //!
 //! The line spectrum arrives in the cosine domain, so it has to be taken back
 //! to frequencies before the quantiser sees it.  The predictor memory is the
@@ -35,6 +35,6 @@ fn replay(path: &str, own_weights: bool) -> usize {
 }
 
 #[test]
-fn db14_chain_excerpt() {
-    assert_eq!(replay("tests/data/db14_chain.txt", true), 120);
+fn quantise_chain_excerpt() {
+    assert_eq!(replay("tests/data/quantise_chain.txt", true), 120);
 }

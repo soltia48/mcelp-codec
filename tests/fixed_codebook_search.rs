@@ -52,6 +52,6 @@ fn replay(path: &str) -> usize {
 }
 
 #[test]
-fn e65e_scores_excerpt() {
-    assert_eq!(replay("tests/data/e65e_scores.txt"), 120);
+fn fixed_codebook_search_excerpt() {
+    assert_eq!(replay("tests/data/fixed_codebook_search.txt"), 120);
 }

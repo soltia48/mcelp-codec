@@ -47,6 +47,10 @@ on 160 new samples at a time.
        excitation ────── build the excitation, update the filter memories
 ```
 
+The subframe loop is described in detail in
+[encoder-loop.md](encoder-loop.md), and the weighting filter it is built
+around in [weighting.md](weighting.md).
+
 The encoder synthesises as it goes. After choosing an excitation it runs it
 through the same synthesis filter the decoder will use, so that the next
 subframe's search starts from exactly the state the decoder will be in. This
@@ -73,8 +77,30 @@ bug shows up as drift rather than as a single bad frame.
   └─ output filter ───── final reconstruction filter, then compand to μ-law
 ```
 
-The decoder is perhaps a tenth of the encoder's work. Everything expensive in
-CELP is in the search.
+## Where the time goes
+
+Everything expensive in CELP is in the search, and the measurements bear that
+out. Encoding and decoding the 3 seconds of `examples/male.orig.ulaw`, on one
+core of a desktop CPU:
+
+| | per 3 s of audio | real time |
+|---|---:|---:|
+| Encode | 37 ms | 81× |
+| Decode | 2.5 ms | 1184× |
+
+The encoder is about **15 times** the decoder's cost. That asymmetry is
+inherent to the design rather than an artefact of this implementation: the
+decoder evaluates one excitation, while the encoder evaluates several hundred
+candidates per subframe and synthesises the winner as well.
+
+Within the encoder, the fixed-codebook search dominates — it is the stage with
+the largest candidate set and the one whose index costs the most bits. The
+spectral front end is the next largest, since it runs an FFT and twenty bands
+of statistics twice per frame.
+
+Both figures are far above real time, so neither side is a practical
+constraint on a modern machine; the ratio is what matters when reasoning about
+where an optimisation would pay.
 
 ## What survives a frame
 

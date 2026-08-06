@@ -30,7 +30,10 @@ end: the signal that reaches the analysis has already been cleaned.
 ## Reading order
 
 Start with [architecture](architecture.md) for the shape of both pipelines,
-then follow the signal:
+then follow the signal. If the vocabulary is unfamiliar, keep
+[glossary.md](glossary.md) open alongside; if you would rather see the thing
+before the theory, [walkthrough.md](walkthrough.md) takes one real frame
+apart.
 
 | document | subject |
 |---|---|
@@ -38,11 +41,17 @@ then follow the signal:
 | [bitstream.md](bitstream.md) | the 18-byte frame and its fourteen fields |
 | [noise-suppression.md](noise-suppression.md) | the encoder front end: spectrum, critical bands, voice activity, suppression |
 | [lpc.md](lpc.md) | short-term prediction, line spectral frequencies, their quantiser |
+| [weighting.md](weighting.md) | the perceptual weighting filter — how "closest" is measured |
+| [encoder-loop.md](encoder-loop.md) | analysis by synthesis: the target, the impulse response, the memories |
 | [pitch.md](pitch.md) | long-term prediction: the adaptive codebook and its two searches |
 | [fixed-codebook.md](fixed-codebook.md) | the six innovation structures and the 16-bit index that selects one |
 | [gain.md](gain.md) | the conjugate gain codebook and the energy predictor behind it |
 | [synthesis.md](synthesis.md) | the decoder: synthesis, postfiltering, concealment |
 | [fixed-point.md](fixed-point.md) | the arithmetic model everything is computed in |
+| [tables.md](tables.md) | reference data: band edges, class layout, quantiser dimensions |
+| [testing.md](testing.md) | how the implementation is verified, and what is not covered |
+| [walkthrough.md](walkthrough.md) | one real frame, field by field, with the values it decodes to |
+| [glossary.md](glossary.md) | the vocabulary, as used in this codebase |
 
 ## Bit budget
 
@@ -62,6 +71,11 @@ One frame carries 138 bits of parameters plus a suppression flag:
 The remaining 5 bits of the 144 transported are framing. The fixed codebook
 takes 64 of the 138 parameter bits — nearly half the frame — which is where a
 CELP coder's quality comes from at this rate.
+
+Per second, that is 25 frames of: one line spectrum, 100 pitch lags and
+codebook indices, and 100 gains. The spectral envelope is updated 25 times a
+second and the excitation 100 times — a ratio that reflects how much faster
+the excitation changes than the vocal tract does.
 
 ## Conventions in these documents
 

@@ -28,7 +28,9 @@ CELP は *code-excited linear prediction*（符号励振線形予測）の略で
 ## 読む順序
 
 まず[アーキテクチャ](architecture.md)で全体像を掴み、あとは信号の流れに沿って
-読み進めてください。
+読み進めてください。用語に馴染みがなければ [glossary.md](glossary.md) を傍らに、
+理論より先に現物を見たい場合は [walkthrough.md](walkthrough.md) が実フレーム1つを
+分解しています。
 
 | 文書 | 内容 |
 |---|---|
@@ -36,11 +38,17 @@ CELP は *code-excited linear prediction*（符号励振線形予測）の略で
 | [bitstream.md](bitstream.md) | 18バイトのフレームと14個のフィールド |
 | [noise-suppression.md](noise-suppression.md) | エンコーダ前段：スペクトル、臨界帯域、音声区間検出、抑圧 |
 | [lpc.md](lpc.md) | 短期予測、線スペクトル周波数、その量子化器 |
+| [weighting.md](weighting.md) | 聴覚重み付けフィルタ——「近い」をどう測るか |
+| [encoder-loop.md](encoder-loop.md) | 分析合成の実際：目標信号、インパルス応答、記憶の更新 |
 | [pitch.md](pitch.md) | 長期予測：適応コードブックと2段階の探索 |
 | [fixed-codebook.md](fixed-codebook.md) | 6種類の励振構造と、それを選ぶ16ビット索引 |
 | [gain.md](gain.md) | 共役利得コードブックと、その背後にある電力予測器 |
 | [synthesis.md](synthesis.md) | デコーダ：合成、ポストフィルタ、消失補償 |
 | [fixed-point.md](fixed-point.md) | すべての計算が乗る固定小数点演算モデル |
+| [tables.md](tables.md) | 定数表リファレンス：帯域境界、クラス構成、量子化器の諸元 |
+| [testing.md](testing.md) | 実装の検証方法と、検証できていない範囲 |
+| [walkthrough.md](walkthrough.md) | 実フレーム1つをフィールド単位で、復号値まで追う |
+| [glossary.md](glossary.md) | 本コードベースでの用語の使い方 |
 
 ## ビット配分
 
@@ -60,6 +68,11 @@ CELP は *code-excited linear prediction*（符号励振線形予測）の略で
 伝送される144ビットのうち残る5ビットはフレーミングです。固定コードブックが
 パラメータ138ビット中64ビット——ほぼ半分——を占めており、このレートでの
 CELP の品質はここから出てきます。
+
+秒あたりに直すと25フレーム分、すなわち線スペクトル25組、ピッチラグと
+コードブック索引が各100個、利得100個です。スペクトル包絡は毎秒25回、励振は
+毎秒100回更新されることになります。この比は、励振が声道よりどれだけ速く
+変化するかを反映しています。
 
 ## 本文書の表記
 

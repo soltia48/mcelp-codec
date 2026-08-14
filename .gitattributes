@@ -1,0 +1,14 @@
+# The reference data in this repository is compared byte for byte, so the
+# line endings in a checkout have to be the same everywhere.  Without this,
+# a Windows checkout (where git defaults to core.autocrlf=true) turns the LF
+# in the bit streams into CRLF, and they stop matching what the encoder
+# writes.
+* text=auto eol=lf
+
+# The bit streams are text — one hex frame per line — but their bytes are
+# reference values, so pin the ending rather than leave it to the heuristic.
+*.mcelp text eol=lf
+
+# Raw mu-law audio is not text.  It happens to contain no line-ending bytes
+# today, which is the only reason the heuristic has not already mangled it.
+*.ulaw binary

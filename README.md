@@ -24,7 +24,7 @@ A trailing partial frame is dropped, as the reference implementation drops it.
 
 ```toml
 [dependencies]
-mcelp = "0.1"
+mcelp = "1.0"
 ```
 
 `Encoder` and `Decoder` are the entry points. Both carry state between frames,

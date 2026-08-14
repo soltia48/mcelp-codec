@@ -2,7 +2,7 @@ name: Release
 
 # Tag a commit to release it:
 #
-#     git tag v0.1.0 && git push origin v0.1.0
+#     git tag v1.0.0 && git push origin v1.0.0
 #
 # The tag has to match the version in Cargo.toml; the first job checks that
 # before anything is published.

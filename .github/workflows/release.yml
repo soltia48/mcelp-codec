@@ -6,6 +6,17 @@ name: Release
 #
 # The tag has to match the version in Cargo.toml; the first job checks that
 # before anything is published.
+#
+# The jobs run in this order, and the order is the point:
+#
+#     verify ──► binaries ──┬──► github-release
+#                           └──► publish        (crates.io)
+#
+# Publishing to crates.io cannot be undone — a version can be yanked, but not
+# removed, and the number can never be reused.  So everything that can still
+# fail runs first: the suite, the packaging, and a build of the command line
+# tools on all three platforms with a bit-exactness check on each.  Only once
+# all of that has passed does anything irreversible happen.
 on:
   push:
     tags: ["v*"]
@@ -55,7 +66,10 @@ jobs:
 
   publish:
     name: Publish to crates.io
-    needs: verify
+    # Gated on `binaries` as well as `verify`: this is the one step that cannot
+    # be taken back, so it goes last.  A crate published against tools that turn
+    # out not to build, or not to be bit exact, is not something a yank fixes.
+    needs: [verify, binaries]
     if: github.ref_type == 'tag'
     runs-on: ubuntu-latest
     timeout-minutes: 15
@@ -95,6 +109,8 @@ jobs:
       - name: Build
         run: cargo build --release --target ${{ matrix.target }} --bins
 
+      # This is the last gate before `publish`, so it covers the same ground as
+      # the check in ci.yml rather than a sample of it.
       - name: Check the built tools are bit exact
         shell: bash
         run: |
@@ -102,10 +118,14 @@ jobs:
           dir="target/${{ matrix.target }}/release"
           suffix=""
           if [ "${{ runner.os }}" = "Windows" ]; then suffix=".exe"; fi
-          "$dir/mcelp_encode$suffix" < examples/male.orig.ulaw > male.mcelp
-          cmp male.mcelp examples/male.mcelp
-          "$dir/mcelp_decode$suffix" < examples/male.mcelp > male.ulaw
-          cmp male.ulaw examples/male.decoded.ulaw
+          for name in male female; do
+            "$dir/mcelp_encode$suffix" < "examples/$name.orig.ulaw" > "$name.mcelp"
+            cmp "$name.mcelp" "examples/$name.mcelp"
+
+            "$dir/mcelp_decode$suffix" < "examples/$name.mcelp" > "$name.ulaw"
+            cmp "$name.ulaw" "examples/$name.decoded.ulaw"
+          done
+          echo "encoder and decoder are bit exact on ${{ matrix.target }}"
 
       - name: Assemble the archive
         shell: bash

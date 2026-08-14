@@ -1,6 +1,6 @@
 [package]
 name = "mcelp"
-version = "0.1.0"
+version = "1.0.0"
 edition = "2024"
 rust-version = "1.85"
 description = "Mitsubishi CELP speech codec: a 3.6 kbit/s speech encoder and decoder"

@@ -9,10 +9,11 @@ readme = "README.md"
 repository = "https://github.com/soltia48/mcelp-codec"
 keywords = ["codec", "speech", "celp", "audio", "dsp"]
 categories = ["multimedia::audio", "encoding"]
-# The regression suite replays several megabytes of dumps from the reference
-# implementation.  It is the proof the codec is bit exact, but it belongs to the
-# repository rather than to every download of the library.
-exclude = ["tests/"]
+# `tests/` replays several megabytes of dumps from the reference implementation.
+# It is the proof the codec is bit exact, but it belongs to the repository
+# rather than to every download of the library.  `.github/` is likewise of no
+# use to anyone consuming the crate.
+exclude = ["tests/", ".github/"]
 
 [lib]
 name = "mcelp"

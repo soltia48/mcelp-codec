@@ -1,5 +1,9 @@
 # mcelp-codec
 
+[![CI](https://github.com/soltia48/mcelp-codec/actions/workflows/ci.yml/badge.svg)](https://github.com/soltia48/mcelp-codec/actions/workflows/ci.yml)
+[![crates.io](https://img.shields.io/crates/v/mcelp.svg)](https://crates.io/crates/mcelp)
+[![docs.rs](https://docs.rs/mcelp/badge.svg)](https://docs.rs/mcelp)
+
 A Rust implementation of the **Mitsubishi CELP speech codec** (三菱CELP方式音声コーデック).
 
 The crate ships both halves of the codec. Each stage is written as the
@@ -90,6 +94,25 @@ Each stage is checked against data captured from the reference, and
 `tests/api.rs` pins the byte-level round trip. `tests/endtoend.rs` and
 `tests/encode_endtoend.rs` carry the whole of both bundled examples, so a
 change that moves a single bit fails the suite.
+
+## Continuous integration
+
+Every push and pull request runs, in `.github/workflows/ci.yml`:
+
+| job | what it checks |
+|---|---|
+| Lint | `cargo fmt --check`, `cargo clippy -D warnings`, `cargo doc -D warnings` |
+| Test | the suite on Linux, macOS and Windows in release, plus Linux in debug for the overflow checks and `debug_assert`s release drops |
+| MSRV | the whole suite on the `rust-version` declared in `Cargo.toml` |
+| Package | `cargo package`, guarding the size so the excluded regression data cannot creep back in |
+
+Each test job also runs the two command line tools over the bundled examples
+and compares the bytes, so the codec is shown to be bit exact on every
+platform, not merely to compile there.
+
+Tagging a commit `v<version>` runs `.github/workflows/release.yml`, which
+checks the tag against `Cargo.toml`, publishes to crates.io and attaches
+prebuilt tools to a GitHub release.
 
 ## Documentation
 

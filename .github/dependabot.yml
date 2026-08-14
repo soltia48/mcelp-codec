@@ -1,0 +1,10 @@
+version: 2
+updates:
+  # The crate itself has no dependencies, so the only thing to keep current is
+  # the set of actions the workflows pin.
+  - package-ecosystem: github-actions
+    directory: /
+    schedule:
+      interval: monthly
+    commit-message:
+      prefix: "ci"

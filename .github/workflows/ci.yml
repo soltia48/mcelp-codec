@@ -1,0 +1,136 @@
+name: CI
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+  workflow_dispatch:
+
+# A newer push to the same branch supersedes an older run.
+concurrency:
+  group: ci-${{ github.ref }}
+  cancel-in-progress: true
+
+permissions:
+  contents: read
+
+env:
+  CARGO_TERM_COLOR: always
+
+# `-D warnings` is applied in the lint job only.  Setting it globally would
+# make every job fail the day a new compiler release adds a lint, which is
+# noise: the lint job alone reports that, and the tests keep running.
+
+jobs:
+  lint:
+    name: Format, lints and docs
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          components: rustfmt, clippy
+
+      - name: Formatting
+        run: cargo fmt --all --check
+
+      - name: Clippy
+        run: cargo clippy --all-targets -- -D warnings
+
+      - name: Rustdoc
+        env:
+          RUSTDOCFLAGS: -D warnings
+        run: cargo doc --no-deps
+
+  test:
+    name: Test (${{ matrix.os }}, ${{ matrix.profile }})
+    runs-on: ${{ matrix.os }}
+    timeout-minutes: 30
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          # Release is what the suite is normally run in.  Debug is run too,
+          # because it enables the overflow checks and `debug_assert`s that
+          # release drops — several of them guard table bounds.
+          - { os: ubuntu-latest, profile: release }
+          - { os: ubuntu-latest, profile: debug }
+          # The codec is integer-only and platform independent by construction.
+          # Running it elsewhere is what proves that.
+          - { os: macos-latest, profile: release }
+          - { os: windows-latest, profile: release }
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: dtolnay/rust-toolchain@stable
+
+      - name: Test
+        run: cargo test ${{ matrix.profile == 'release' && '--release' || '' }}
+
+      - name: Bit exactness through the command line tools
+        shell: bash
+        run: |
+          set -euo pipefail
+          flag=""
+          if [ "${{ matrix.profile }}" = "release" ]; then flag="--release"; fi
+          for name in male female; do
+            cargo run $flag --quiet --bin mcelp_encode \
+              < "examples/$name.orig.ulaw" > "$name.mcelp"
+            cmp "$name.mcelp" "examples/$name.mcelp"
+
+            cargo run $flag --quiet --bin mcelp_decode \
+              < "examples/$name.mcelp" > "$name.ulaw"
+            cmp "$name.ulaw" "examples/$name.decoded.ulaw"
+          done
+          echo "encoder and decoder are bit exact on ${{ matrix.os }}"
+
+  msrv:
+    name: Minimum supported Rust version
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Read rust-version from Cargo.toml
+        id: msrv
+        run: |
+          version=$(grep -m1 '^rust-version' Cargo.toml | cut -d'"' -f2)
+          echo "version=$version" >> "$GITHUB_OUTPUT"
+          echo "Cargo.toml declares rust-version = $version"
+
+      - uses: dtolnay/rust-toolchain@master
+        with:
+          toolchain: ${{ steps.msrv.outputs.version }}
+
+      # Building is not enough: the declared version has to be able to run the
+      # suite, or the claim in Cargo.toml is not worth much.
+      - name: Test on the declared minimum
+        run: cargo test --release
+
+  package:
+    name: Package
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: dtolnay/rust-toolchain@stable
+
+      # `exclude` in Cargo.toml keeps several megabytes of regression data out
+      # of the published crate.  If it ever stops matching, this is where it
+      # shows up.
+      - name: Build the crate archive
+        run: cargo package
+
+      - name: Report contents and size
+        run: |
+          set -euo pipefail
+          cargo package --list | sed 's/^/  /'
+          size=$(du -k target/package/*.crate | cut -f1)
+          echo "crate archive: ${size} KiB"
+          if [ "$size" -gt 1024 ]; then
+            echo "::error::crate archive is ${size} KiB, over the 1 MiB guard - is the exclude list still right?"
+            exit 1
+          fi
